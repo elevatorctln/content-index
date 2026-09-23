@@ -1,0 +1,80 @@
+spec_version = 1
+id = "KSP-Redux"
+type = "mod"
+name = "KSP-Redux"
+authors = ["Plazma_Boltz"]
+abstract = "Brings the Kerbal Space Program system to Kitten Space Agency, with its bodies, textures and music."
+description = """
+Current Features:
+
+- Entire Stock System
+- Outer Planets Mod ([Addon Link](https://spacedock.info/mod/4071/KSP-Redux%20-%20OPM%20Addon))
+- KSP Music
+- [Compendium](https://spacedock.info/mod/4074/Compendium) Support (not required)
+
+Planned features:
+
+- Better Atmospheres
+- KSP Parts
+- Higher Quality Textures
+- Actual Kerbals
+
+--- HOW TO INSTALL ---
+1. Download the .zip file
+2. Unzip it
+3. Put it in your KSA directory under your Content folder
+4. Find your manifest.toml file (also in the content folder)
+5. Insert the following into the manifest.toml file
+
+```
+[[mods]]
+id = "KSP-Redux"
+enabled = true
+```
+
+there can be no spaces or line breaks between any parts of the manifest.toml. This means your manifest should look like this:
+
+```
+[[mods]]
+id = "Core"
+enabled = true
+[[mods]]
+id = "KSP-Redux"
+enabled = true
+```
+
+--- WANT TO CONTRIBUTE? ---
+That's great! Just ping me on the KSA discord (@PlazmaBoltz) in the modding channel. I really want this to be more of a community project instead of just me and 1 other dev.
+
+When will the receive updates?
+
+- It will receive updates whenever something significant is added or bug fixes are made
+
+Known Issues:
+- Sometimes planets will appear with only half of their texture
+
+Credits:
+
+- PlazmaBoltz: Creator
+- KerbalChris: Music
+- Derpikus: Planet Assets
+- _emu__: Minmus Texture
+
+- The people who made the OPM KSP mod: Textures for the OPM System
+"""
+license = "MIT"
+tags = ["celestial", "visual", "audio"]
+
+[releases]
+github = "PlazmaBoltz/KSP-Redux"
+spacedock = 4040
+authority = "spacedock"
+
+[links]
+forums = "https://forums.ahwoo.com/threads/ksp-redux.338/"
+repository = "https://github.com/PlazmaBoltz/KSP-Redux"
+spacedock = "https://spacedock.info/mod/4040/KSP-Redux"
+bugtracker = "https://github.com/PlazmaBoltz/KSP-Redux/issues"
+
+[compatibility]
+game_min = "2026.6.9.4750"

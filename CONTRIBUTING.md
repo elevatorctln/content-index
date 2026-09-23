@@ -6,6 +6,8 @@ If you want to argue about the format or the index itself, open a thread in [con
 
 ## Listing your content
 
+The [listing page](https://ksamodding.github.io/content-index/) writes or changes your listing section by section, starting from your GitHub repository, and checks it with the rules below before you open the pull request.
+
 1. Write your authored document following [RFC 0031](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0031-content-metadata-format.md).
    The worked examples in [`examples/`](https://github.com/KSAModding/content-manager-design/tree/main/examples) are real listings you can copy from.
 2. Put it at `listings/<id>.toml`, where `<id>` is the folder name your content installs as.
@@ -29,8 +31,30 @@ If you want to argue about the format or the index itself, open a thread in [con
    python3 tools/check_release.py listings/<id>.toml
    ```
 
-4. Open a pull request that adds exactly one file.
-   One document merges itself. A pull request carrying two, or carrying anything besides a document, is valid but waits for a steward.
+   A release archive can be at most 4 GiB, and the release check and the watcher reject a larger one.
+
+4. Open a pull request that adds your document, or several of them.
+   Up to 15 documents merge themselves, as long as ownership verifies for every one of them: control of the release host for a listing, the account in `packs/<id>/owner.json` for a pack.
+   A pull request that carries anything besides documents, or more than 15 of them, is valid but waits for a steward.
+
+## The license field
+
+`license` is an SPDX license expression.
+For one license, write its identifier from the [SPDX license list](https://spdx.org/licenses/), such as `MIT` or `CC-BY-SA-4.0`.
+The identifier is the short form with hyphens, so `CC BY-SA 4.0` is not valid.
+
+When parts of your content have different licenses, join them with `AND`.
+For example, code under GPL-2.0 and data files under CC BY-SA 4.0:
+
+```toml
+license = "GPL-2.0-only AND CC-BY-SA-4.0"
+```
+
+When the user may choose one of several licenses, join them with `OR`, such as `MIT OR Apache-2.0`.
+A comma does not join licenses, and two identifiers written next to each other do not either, so `MIT Apache-2.0` is refused.
+
+A license that is not on the SPDX list can be named as `LicenseRef-` followed by a name of your choice, such as `LicenseRef-MyModLicense`.
+An image can have its own `license` in its record when its terms differ from those of the content, see [Images](#images).
 
 ## Images
 
@@ -61,6 +85,25 @@ When the image breaks a limit, the tool names the limit and prints no record.
 
 By adding an image record, you state that you have the right to publish the image and to let clients fetch, display and cache it under the record's `license`, or under the document's `license` when the record names none.
 When the image is third-party work, or its license requires credit, a license notice or a link to the original, put that into the record's `attribution` and `source`.
+
+## Launching a mod loader
+
+A `mod-loader` listing names the file a player starts in `[provides].launch`.
+When your loader starts differently on one platform, add an entry for that platform, per [RFC 0067](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0067-per-platform-launch.md):
+
+```toml
+[provides]
+launch = "StarMap.exe"
+
+[provides.platform.linux]
+runtime = "dotnet"
+launch = "StarMap.dll"
+```
+
+On Linux, a manager then starts `dotnet` with `StarMap.dll`, and on every other platform it starts `StarMap.exe`.
+The platform names are `windows`, `linux` and `macos`.
+Leave out `runtime` when your loader has its own executable on that platform.
+Every `launch` must be in your release archive, or the release is rejected.
 
 ## Claiming and updating a pack
 

@@ -1,6 +1,6 @@
 # Schemas
 
-`authored.schema.json` is the machine-readable form of the authored document defined by [RFC 0031](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0031-content-metadata-format.md) and extended by [RFC 0035](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0035-content-install-descriptor.md), [RFC 0049](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0049-instance-handover.md) and [RFC 0058](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0058-listing-images-and-dates.md), and amended by [RFC 0065](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0065-icon-center-crop.md).
+`authored.schema.json` is the machine-readable form of the authored document defined by [RFC 0031](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0031-content-metadata-format.md) and extended by [RFC 0035](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0035-content-install-descriptor.md), [RFC 0049](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0049-instance-handover.md), [RFC 0058](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0058-listing-images-and-dates.md) and [RFC 0067](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0067-per-platform-launch.md), and amended by [RFC 0065](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0065-icon-center-crop.md).
 
 It is JSON Schema 2020-12, and it covers all three types the format defines today: `mod`, `mod-loader` and `modpack`.
 
@@ -57,6 +57,23 @@ The schema expects a string. `check_schema.normalise` turns a native date or tim
 
 The two spellings are equivalent with one exception: TOML also allows a space in place of the `T`, and only the bare form survives it. Bare, the parser produces a datetime and `normalise` writes the `T` back; quoted, the space stays in the string and the schema rejects it.
 
+## Launch per platform
+
+A `mod-loader` listing that starts differently on one platform adds an entry for it in `[provides.platform]`, per RFC 0067:
+
+```toml
+[provides]
+launch = "StarMap.exe"
+
+[provides.platform.linux]
+runtime = "dotnet"
+launch = "StarMap.dll"
+```
+
+The platform names are `windows`, `linux` and `macos`.
+Each entry needs `launch`, a path relative to the loader's install location, and can add `runtime = "dotnet"`, which starts `dotnet` with `launch` as its first argument.
+A platform without an entry starts `[provides].launch`, so the table is valid only next to it.
+
 ## What the schema does not cover
 
 Some rules cannot be expressed in JSON Schema at all. `check_schema.py` applies these after the schema passes:
@@ -73,13 +90,14 @@ Some rules need more than the document, and belong to the checks around it:
 | Rule | Where it belongs |
 |---|---|
 | Every SPDX identifier exists in the SPDX list | `tools/check_license.py`. The list is versioned data and must not be frozen into a schema, so it arrives as a pinned dependency instead. |
+| Two identifiers in a `license` expression have an operator between them | `tools/check_license.py`, which names the missing `AND` or `OR`. The schema pattern refuses the shape as well. |
 | The id does not collide with another listing, case-insensitively | `tools/check_index.py` |
 | A changed document names a forums thread that no other listing or pack names, compared by thread id | `tools/check_index.py` warns only. The id comes from the `links.forums` pattern, so every URL form of one thread compares equal. |
 | A changed document has an `abstract` of at most 280 characters | `tools/check_index.py` warns only. RFC 0031 calls the abstract one or two sentences, and a longer one breaks list views. |
 | The document sits at the path its id and type say | `tools/check_layout.py` |
 | `[loader].id` references content of type `mod-loader`, a dependency id references a `mod`, and a pack member is not itself a pack | `tools/check_index.py` |
 | A named `any_of` member carried `Optional = true` in the archive's own `mod.toml` | the stamper ([content-index-releases#13](https://github.com/KSAModding/content-index-releases/issues/13)), which is the only place the archive is read |
-| `[provides].launch` names a file the release actually contains | the stamper |
+| `[provides].launch` and the `launch` of each `[provides.platform]` entry name a file the release actually contains | the stamper |
 | `install.root` is derivable, and the archive downloads and hashes | `tools/check_release.py`, which reaches the answer by running the stamper against the real archive rather than by repeating its rules |
 | The change is narrow enough to merge itself | `tools/check_scope.py` |
 | A changed document has a curated tag, and each free-form tag is in the curated list | `tools/check_tags.py` warns only. `mod`, `mod-loader` and `modpack` share the `mod` list in `tags.toml`. |

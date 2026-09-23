@@ -81,6 +81,8 @@ STANDALONE = '\n[install]\ntarget = "standalone"\n\n[provides]\nlaunch = "x.exe"
 # The instance table on that loader, so each instance case adds only its keys.
 INSTANCE = STANDALONE + "\n[provides.instance]\n"
 
+PLATFORM = STANDALONE + "\n[provides.platform.linux]\n"
+
 ICON_URL = 'url = "https://example.invalid/icon.png"'
 ICON_DIGEST = f'sha256 = "{"a" * 64}"'
 ICON = f"\n[images.icon]\n{ICON_URL}\n{ICON_DIGEST}\nwidth = 512\nheight = 512\nsize = 48213\n"
@@ -216,10 +218,10 @@ REJECTED = [
     # Install
     ("unknown install key", mod(append='\n[install]\nsubfolder = "x"\n'), "install: Additional properties are not allowed ('subfolder'"),
     ("install root escaping the archive", mod(append='\n[install]\nroot = "../elsewhere"\n'), "install.root: '../elsewhere' is a path that leaves its anchor"),
-    ("install root as an absolute path", mod(append='\n[install]\nroot = "/etc/passwd"\n'), "install.root: '/etc/passwd' does not match"),
-    ("install root as a Windows path", mod(append='\n[install]\nroot = "C:/Windows"\n'), "install.root: 'C:/Windows' does not match"),
-    ("install root with a backslash separator", mod(append='\n[install]\nroot = "build\\\\TestMod"\n'), "install.root: 'build\\\\TestMod' does not match"),
-    ("install root under a home shortcut", mod(append='\n[install]\nroot = "~/mods"\n'), "install.root: '~/mods' does not match"),
+    ("install root as an absolute path", mod(append='\n[install]\nroot = "/etc/passwd"\n'), "install.root: '/etc/passwd' is not a relative path with / separators"),
+    ("install root as a Windows path", mod(append='\n[install]\nroot = "C:/Windows"\n'), "install.root: 'C:/Windows' is not a relative path with / separators"),
+    ("install root with a backslash separator", mod(append='\n[install]\nroot = "build\\\\TestMod"\n'), "install.root: 'build\\\\TestMod' is not a relative path with / separators"),
+    ("install root under a home shortcut", mod(append='\n[install]\nroot = "~/mods"\n'), "install.root: '~/mods' is not a relative path with / separators"),
     ("install root hiding a parent segment", mod(append='\n[install]\nroot = "build/../../etc"\n'), "install.root: 'build/../../etc' is a path that leaves its anchor"),
     ("install root through a device name", mod(append='\n[install]\nroot = "build/NUL/x"\n'), "install.root: 'build/NUL/x' is a path through a reserved Windows device name"),
     ("a step that is not prose", mod(append="\n[install]\nsteps = [3]\n"), "install.steps[0]: 3 is not of type 'string'"),
@@ -253,12 +255,25 @@ REJECTED = [
     ("an instance variable that is not a string", loader(append=INSTANCE + "variable = 3\n"), "provides.instance.variable: 3 is not of type 'string'"),
     ("an unknown key inside instance", loader(append=INSTANCE + 'flag = "-InstancePath"\npath = "Instances"\n'), "provides.instance: Additional properties are not allowed ('path'"),
     ("an instance table on a mod", mod(append='\n[provides.instance]\nflag = "-InstancePath"\n'), "provides: this key is not allowed here"),
+    ("a platform table on a mod", mod(append='\n[provides]\nlaunch = "TestMod.exe"\n\n[provides.platform.linux]\nlaunch = "TestMod.dll"\n'), "provides: this key is not allowed here"),
+    ("a platform table on a pack", pack(append='\n[provides]\nlaunch = "x.exe"\n\n[provides.platform.linux]\nlaunch = "x.dll"\n'), "provides: this key is not allowed here"),
+    ("a platform table without a launch", loader(append='\n[install]\ntarget = "game-root"\n\n[provides.platform.linux]\nlaunch = "x.dll"\n'), "provides: 'launch' is a dependency of 'platform'"),
+    ("a platform table with no entry", loader(append=PLATFORM.replace(".linux]", "]")), "provides.platform: {} should be non-empty"),
+    ("a platform entry without a launch", loader(append=PLATFORM + 'runtime = "dotnet"\n'), "provides.platform.linux: 'launch' is a required property"),
+    ("an unknown platform", loader(append=PLATFORM.replace("linux", "freebsd") + 'launch = "x"\n'), "provides.platform: 'freebsd' is not one of ['windows', 'linux', 'macos']"),
+    ("an unknown runtime", loader(append=PLATFORM + 'runtime = "mono"\nlaunch = "x.dll"\n'), "provides.platform.linux.runtime: 'mono' is not one of ['dotnet']"),
+    ("an unknown key inside a platform entry", loader(append=PLATFORM + 'launch = "x.dll"\narguments = "-x"\n'), "provides.platform.linux: Additional properties are not allowed ('arguments'"),
+    ("a platform entry that is not a table", loader(append=STANDALONE + '\n[provides.platform]\nlinux = "x.dll"\n'), "provides.platform.linux: 'x.dll' is not of type 'object'"),
+    ("a platform launch that leaves the install location", loader(append=PLATFORM + 'launch = "../x.dll"\n'), "provides.platform.linux.launch: '../x.dll' is a path that leaves its anchor"),
+    ("a platform launch as an absolute path", loader(append=PLATFORM + 'launch = "/usr/bin/dotnet"\n'), "provides.platform.linux.launch: '/usr/bin/dotnet' is not a relative path with / separators"),
+    ("a platform launch through a device name", loader(append=PLATFORM + 'launch = "NUL"\n'), "provides.platform.linux.launch: 'NUL' is a path through a reserved Windows device name"),
 
     # License
     ("unbalanced parentheses in the license", mod(replace=('license = "MIT"', 'license = "(MIT OR Apache-2.0"')), "license: '(MIT OR Apache-2.0' has unbalanced parentheses"),
     ("a license closing a parenthesis it never opened", mod(replace=('license = "MIT"', 'license = "MIT)"')), "license: 'MIT)' has unbalanced parentheses"),
     ("a license closing before opening", mod(replace=('license = "MIT"', 'license = ")("')), "license: ')(' has unbalanced parentheses"),
-    ("a license operator with no right side", mod(replace=('license = "MIT"', 'license = "MIT OR"')), "license: 'MIT OR' does not match"),
+    ("a license operator with no right side", mod(replace=('license = "MIT"', 'license = "MIT OR"')), "license: 'MIT OR' is not an SPDX license expression"),
+    ("several licenses joined by a comma", mod(replace=('license = "MIT"', 'license = "GPL-2.0, CC BY-SA 4.0"')), "license: 'GPL-2.0, CC BY-SA 4.0' is not an SPDX license expression, such as MIT, or GPL-2.0-only AND CC-BY-SA-4.0 for several licenses"),
 
     # Images
     ("an unknown role in images", mod(append='\n[images]\nbanner = "x"\n'), "images: Additional properties are not allowed ('banner'"),
@@ -273,7 +288,7 @@ REJECTED = [
     ("an icon above the pixel limit", mod(append=ICON.replace("height = 512", "height = 2049")), "images.icon.height: 2049 is greater than the maximum of 2048"),
     ("an icon above the byte cap", mod(append=ICON.replace("size = 48213", "size = 262145")), "images.icon.size: 262145 is greater than the maximum of 262144"),
     ("an image with a size of zero", mod(append=ICON.replace("size = 48213", "size = 0")), "images.icon.size: 0 is less than the minimum of 1"),
-    ("an image license that is not an expression", mod(append=ICON + 'license = "MIT OR"\n'), "images.icon.license: 'MIT OR' does not match"),
+    ("an image license that is not an expression", mod(append=ICON + 'license = "MIT OR"\n'), "images.icon.license: 'MIT OR' is not an SPDX license expression"),
     ("an empty attribution", mod(append=ICON + 'attribution = ""\n'), "images.icon.attribution: '' should be non-empty"),
     ("a description image without an id", mod(append=SHOT.replace('id = "shot"\n', "")), "images.description[0]: 'id' is a required property"),
     ("a description image id starting with a dash", mod(append=SHOT.replace('id = "shot"', 'id = "-shot"')), "images.description[0].id: '-shot' is not 1 to 64 ASCII letters"),
@@ -324,11 +339,15 @@ ACCEPTED = [
     ("an instance table naming both keys", loader(append=INSTANCE + 'flag = "-InstancePath"\nvariable = "STARMAP_INSTANCE_PATH"\n')),
     ("an instance table naming only the flag", loader(append=INSTANCE + 'flag = "-InstancePath"\n')),
     ("an instance table naming only the variable", loader(append=INSTANCE + 'variable = "STARMAP_INSTANCE_PATH"\n')),
+    ("a platform entry run by dotnet", loader(append=PLATFORM + 'runtime = "dotnet"\nlaunch = "StarMap.dll"\n')),
+    ("a platform entry with its own executable", loader(append=PLATFORM + 'launch = "bin/StarMap"\n')),
+    ("an entry for every platform", loader(append=STANDALONE + '\n[provides.platform.windows]\nlaunch = "StarMap.exe"\n\n[provides.platform.linux]\nruntime = "dotnet"\nlaunch = "StarMap.dll"\n\n[provides.platform.macos]\nruntime = "dotnet"\nlaunch = "StarMap.dll"\n')),
     ("a pre-release loader bound", mod(append='\n[loader]\nid = "StarMap"\nmin = "0.5.0-rc.1"\n')),
     ("a pre-release ordered below its release", mod(append='\n[loader]\nid = "StarMap"\nmin = "0.5.0-rc.1"\nmax = "0.5.0"\n')),
     ("a numeric pre-release below an alphanumeric one", mod(append='\n[loader]\nid = "StarMap"\nmin = "1.0.0-1"\nmax = "1.0.0-alpha"\n')),
     ("build metadata on a bound", mod(append='\n[loader]\nid = "StarMap"\nmin = "0.4.5+build.7"\nmax = "0.4.5"\n')),
     ("a compound license expression", mod(replace=('license = "MIT"', 'license = "(MIT OR Apache-2.0) AND CC0-1.0"'))),
+    ("several licenses joined with AND", mod(replace=('license = "MIT"', 'license = "GPL-2.0-only AND CC-BY-SA-4.0"'))),
     ("a license exception", mod(replace=('license = "MIT"', 'license = "GPL-2.0-or-later WITH Bison-exception-2.2"'))),
     ("a custom license reference", mod(replace=('license = "MIT"', 'license = "LicenseRef-Kitten-1.0"'))),
     ("a dotted id", mod(replace=('id = "TestMod"', 'id = "Kitten.Tools"'))),

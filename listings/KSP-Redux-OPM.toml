@@ -1,0 +1,55 @@
+spec_version = 1
+id = "KSP-Redux-OPM"
+type = "mod"
+name = "KSP-Redux - OPM Addon"
+authors = ["Plazma_Boltz"]
+abstract = "Adds the Outer Planets Mod to KSP-Redux."
+description = """
+**Requires KSP-Redux to work**
+
+**Built for KSP-Redux 1.2.0**
+
+--- HOW TO INSTALL ---
+1. Download the .zip file
+2. Unzip it
+3. Put it in your KSA directory under your Content folder
+4. Find your manifest.toml file (also in the content folder)
+5. Insert the following into the manifest.toml file
+
+```
+[[mods]]
+id = "KSP-Redux-OPM"
+enabled = true
+```
+
+there can be no spaces or line breaks between any parts of the manifest.toml. This means your manifest should look like this:
+
+```
+[[mods]]
+id = "Core"
+enabled = true
+[[mods]]
+id = "KSP-Redux"
+enabled = true
+[[mods]]
+id = "KSP-Redux-OPM"
+enabled = true
+```
+"""
+license = "MIT"
+tags = ["celestial", "visual"]
+
+[releases]
+spacedock = 4071
+
+[links]
+forums = "https://forums.ahwoo.com/threads/ksp-redux.338/"
+spacedock = "https://spacedock.info/mod/4071/KSP-Redux%20-%20OPM%20Addon"
+
+[compatibility]
+game_min = "2026.1.3.3194"
+
+[[dependencies]]
+id = "KSP-Redux"
+kind = "required"
+min = "1.2.0"

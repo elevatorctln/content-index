@@ -47,3 +47,11 @@ game-path = "GameLocation"
 [provides.instance]
 flag = "-InstancePath"
 variable = "STARMAP_INSTANCE_PATH"
+
+[provides.platform.linux]
+runtime = "dotnet"
+launch = "StarMap.dll"
+
+[provides.platform.macos]
+runtime = "dotnet"
+launch = "StarMap.dll"
