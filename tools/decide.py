@@ -9,6 +9,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import sys
 import tomllib
 import urllib.error
@@ -24,8 +25,9 @@ import pack_ownership
 
 GITHUB_API = "https://api.github.com"
 GRAPHQL = "https://api.github.com/graphql"
-SPACEDOCK_API = "https://spacedock.info/api"
-USER_AGENT = "KSAModding-content-index-ownership"
+USER_AGENT = ownership.USER_AGENT
+# The entry types of the Git trees API, named as the contents API names them.
+TREE_KINDS = {"tree": "dir", "blob": "file", "commit": "submodule"}
 
 # The required check in the branch ruleset. No job may carry this name.
 STATUS_CONTEXT = "validate"
@@ -47,6 +49,10 @@ DOCUMENT_LABELS = tuple(kind for kind, _ in check_scope.KINDS)
 COMMENT_MARKER = "<!-- content-index:verdict -->"
 
 PULL_REQUEST_EVENT = "pull_request"
+
+STATUS_FILE = "index-status.toml"
+# A listing path that is safe to put into a URL and into Markdown.
+PLAIN_LISTING = re.compile(r"listings/[A-Za-z0-9._-]+\.toml")
 
 PASS = "pass"
 REJECT = "reject"
@@ -83,30 +89,30 @@ def _comment(first, verdict, paragraphs=(), run_url="", rerun=False):
     return "\n\n".join(sections)
 
 
-def decide(verdict, candidate, ownership_result, run_url=""):
+def decide(verdict, candidate, ownership_result, run_url="", advice=()):
     """The status reports validation alone. Ownership is a separate axis, so a
     listing that validates but cannot prove it is green and waits for a steward.
+
+    `advice` goes into the comment whatever the outcome.
     """
     outcome = verdict.get("verdict")
+
+    def comment(first, paragraphs=(), rerun=False):
+        return _comment(first, verdict, [*paragraphs, *advice], run_url, rerun)
 
     if outcome == REJECT:
         return Decision(
             "failure",
             "the validation rejected this change",
-            comment=_comment(
-                "The validation rejected this change.", verdict, run_url=run_url, rerun=True
-            ),
+            comment=comment("The validation rejected this change.", rerun=True),
         )
 
     if outcome != PASS:
         return Decision(
             "error",
             "the validation could not reach a verdict",
-            comment=_comment(
-                "The validation could not reach a verdict, so nothing is decided yet.",
-                verdict,
-                run_url=run_url,
-                rerun=True,
+            comment=comment(
+                "The validation could not reach a verdict, so nothing is decided yet.", rerun=True
             ),
         )
 
@@ -114,11 +120,9 @@ def decide(verdict, candidate, ownership_result, run_url=""):
         return Decision(
             "failure",
             "the pack ownership check rejected this change",
-            comment=_comment(
+            comment=comment(
                 "The pack ownership check rejected this change.",
-                verdict,
                 [_sentence(ownership_result.reason)],
-                run_url,
                 rerun=True,
             ),
         )
@@ -129,12 +133,7 @@ def decide(verdict, candidate, ownership_result, run_url=""):
             "success",
             "validated, and a steward decides",
             needs_steward=True,
-            comment=_comment(
-                "Validated.",
-                verdict,
-                [f"A steward has to merge this one, because {reason}."],
-                run_url,
-            ),
+            comment=comment("Validated.", [f"A steward has to merge this one, because {reason}."]),
         )
 
     if ownership_result.state == ownership.VERIFIED:
@@ -150,12 +149,7 @@ def decide(verdict, candidate, ownership_result, run_url=""):
             "success",
             "validated, arming auto-merge",
             auto_merge=True,
-            comment=_comment(
-                "Validated.",
-                verdict,
-                [next_step],
-                run_url,
-            ),
+            comment=comment("Validated.", [next_step]),
         )
 
     if ownership_result.state == ownership.COULD_NOT_EVALUATE:
@@ -163,37 +157,23 @@ def decide(verdict, candidate, ownership_result, run_url=""):
             "success",
             "validated, ownership could not be checked",
             needs_steward=True,
-            comment=_comment(
+            comment=comment(
                 "Validated.",
-                verdict,
                 [
                     "The ownership check reached no verdict, so this waits for a steward.",
                     _sentence(ownership_result.reason),
                 ],
-                run_url,
             ),
         )
 
-    instructions = ownership_result.instructions or (
-        "The proof is something only you can put on the release repository, which "
-        "is what says you agree to it being indexed. Either set the topic "
-        f"`{ownership.TOPIC.format(login='<your-github-username>')}` on it, or commit "
-        f"`{ownership.MARKER_PATH}` naming your username. For a SpaceDock host, set "
-        "your GitHub repository as the mod's source code link on SpaceDock, and put "
-        "the proof on that repository."
-    )
+    instructions = ownership_result.instructions or ownership.ADVICE
     return Decision(
         "success",
         "validated, ownership not verified",
         needs_steward=True,
-        comment=_comment(
+        comment=comment(
             "Validated, and ownership is not verified, so a steward decides.",
-            verdict,
-            [
-                _sentence(ownership_result.reason),
-                instructions,
-            ],
-            run_url,
+            [_sentence(ownership_result.reason), instructions],
         ),
     )
 
@@ -277,36 +257,40 @@ class Api:
         except (ValueError, UnicodeDecodeError):
             return None
 
-    def spacedock_mod(self, mod_id):
-        """SpaceDock's info about a mod, as it gives it."""
-        url = f"{SPACEDOCK_API}/mod/{urllib.parse.quote(str(mod_id), safe='')}"
-        headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-        request = urllib.request.Request(url, headers=headers)
-        refused = False
-        try:
-            with urllib.request.urlopen(request, timeout=30) as answer:
-                text = answer.read()
-        except urllib.error.HTTPError as error:
-            if error.code == 404:
-                return None
-            if error.code not in (401, 403):
-                raise ownership.Unavailable(f"HTTP {error.code} asking SpaceDock for mod {mod_id}")
-            refused = True
-            text = error.read()
-        except OSError as error:
-            raise ownership.Unavailable(str(error)) from error
+    def folder(self, path, ref):
+        """The (name, type) entries of a folder of this repository on `ref`.
 
-        try:
-            document = json.loads(text)
-        except ValueError as error:
-            raise ownership.Unavailable(
-                f"SpaceDock answered about mod {mod_id} with something that is not JSON"
-            ) from error
-        if not isinstance(document, dict):
-            raise ownership.Unavailable(f"SpaceDock answered about mod {mod_id} with no document")
-        if refused and not document.get("error"):
-            raise ownership.Unavailable(f"HTTP 4xx asking SpaceDock for mod {mod_id}")
-        return document
+        A folder that is not there has none. The entries come from the Git trees
+        API, which lists far more entries than the contents API. A listing that
+        GitHub cuts short is Unavailable, never used. The types are the ones the
+        contents API gives, "dir" and "file".
+        """
+        tree = urllib.parse.quote(f"{ref}:{path}", safe="")
+        answer = self._other(f"/repos/{self.repository}/git/trees/{tree}")
+        if answer is None:
+            return []
+        entries = answer.get("tree") if isinstance(answer, dict) else None
+        if not isinstance(entries, list):
+            raise ownership.Unavailable(f"{path} on {ref} is not a folder")
+        if answer.get("truncated"):
+            raise ownership.Unavailable(f"{path} on {ref} has too many entries to list")
+        return [
+            (entry.get("path") or "", TREE_KINDS.get(entry.get("type"), entry.get("type") or ""))
+            for entry in entries
+            if isinstance(entry, dict)
+        ]
+
+    def spacedock_mod(self, mod_id):
+        return ownership.spacedock_mod(mod_id, USER_AGENT)
+
+    def merge_base(self, base_ref, head_sha):
+        """The commit that the diff of a pull request and its merge start from."""
+        base = urllib.parse.quote(base_ref, safe="/")
+        answer = self._other(f"/repos/{self.repository}/compare/{base}...{head_sha}", per_page=1)
+        sha = ((answer or {}).get("merge_base_commit") or {}).get("sha")
+        if not isinstance(sha, str) or not sha:
+            raise ownership.Unavailable(f"GitHub names no merge base of {base_ref} and {head_sha[:7]}")
+        return sha
 
     def graphql(self, query, variables):
         if self.dry_run:
@@ -561,6 +545,192 @@ def ownership_for_all(api, pull, paths, head_sha):
     return ownership.Result(worst.state, reason, worst.proof, worst.instructions)
 
 
+def new_file_url(repository, branch, path, text):
+    """GitHub's page that commits a new file to `branch`, with the content filled in."""
+    return (
+        f"https://github.com/{repository}/new/{urllib.parse.quote(branch, safe='/')}"
+        f"?filename={urllib.parse.quote(path, safe='/')}&value={urllib.parse.quote(text, safe='')}"
+    )
+
+
+def owner_advice(pull, paths):
+    """The owner records a first pack claim lacks, each as a comment paragraph
+    with its content and a link that adds it to the head branch. A commit there
+    runs the checks again. A head repository that is gone gets no link.
+    """
+    user = pull.get("user") or {}
+    text = pack_ownership.record_text(user.get("login"), user.get("id"))
+    _, problem = pack_ownership.parse_record(text, "the pull request author")
+    if problem:
+        return []
+
+    head = pull.get("head") or {}
+    repository = (head.get("repo") or {}).get("full_name") or ""
+    branch = head.get("ref") or ""
+    owner, _, name = repository.partition("/")
+    reachable = bool(branch) and all(ownership.GITHUB_NAME.match(part) for part in (owner, name))
+
+    paragraphs = []
+    for path in paths:
+        # The path comes from the pull request, so only a plain one goes into Markdown.
+        if not pack_ownership.OWNER_RECORD.fullmatch(path):
+            continue
+        lines = [
+            f"A first pack claim also adds `{path}`, naming the account that opened this "
+            "pull request:",
+            "",
+            "```json",
+            text.rstrip("\n"),
+            "```",
+            "",
+        ]
+        if reachable:
+            lines.append(
+                f"[Add {path} to this pull request]({new_file_url(repository, branch, path, text)}). "
+                "GitHub opens the new file on the branch of this pull request with this content, "
+                "and a commit there runs the checks again. If the file opens empty, paste the "
+                "content above."
+            )
+        else:
+            lines.append(
+                "The head repository of this pull request cannot be reached, so there is no "
+                "link. Add the file with this content next to the pack version."
+            )
+        paragraphs.append("\n".join(lines))
+    return paragraphs
+
+
+def _states(text):
+    """The (state, version) pairs of every id in an index-status.toml text,
+    keyed casefolded, or None when the text does not parse.
+    """
+    try:
+        document = tomllib.loads(text or "")
+    except tomllib.TOMLDecodeError:
+        return None
+    entries = document.get("entries")
+    states = {}
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+            continue
+        version = entry.get("version")
+        pair = (str(entry.get("state")), version if isinstance(version, str) else None)
+        states.setdefault(entry["id"].casefold(), set()).add(pair)
+    return states
+
+
+def status_subjects(api, base_ref, head_sha):
+    """The listings and packs on `base_ref` whose index state the change sets,
+    lifts or changes, as (kind, name) pairs in the base branch's spelling, and
+    what stopped the read. A file that does not parse names nothing, because
+    the validation rejects it.
+
+    The states are compared with the merge base, as the diff and the merge are,
+    so a state that another pull request changed on the base branch after this
+    one was cut is not counted as a change of this one.
+    """
+    try:
+        merge_base = api.merge_base(base_ref, head_sha)
+        base = _states(api.file(api.repository, STATUS_FILE, ref=merge_base))
+        head = _states(api.file(api.repository, STATUS_FILE, ref=head_sha))
+        listings = {
+            name[: -len(".toml")].casefold(): name
+            for name, kind in api.folder("listings", base_ref)
+            if kind == "file" and name.lower().endswith(".toml")
+        }
+        packs = {name.casefold(): name for name, kind in api.folder("packs", base_ref) if kind == "dir"}
+    except ownership.Unavailable as error:
+        return [], str(error)
+    if base is None or head is None:
+        return [], ""
+
+    subjects = []
+    for folded in sorted(set(base) | set(head)):
+        if base.get(folded, set()) == head.get(folded, set()):
+            continue
+        if folded in listings:
+            subjects.append((check_scope.LISTING_KIND, f"listings/{listings[folded]}"))
+        elif folded in packs:
+            subjects.append((check_scope.PACK_KIND, packs[folded]))
+    return subjects, ""
+
+
+def _mention(logins):
+    names = " ".join(f"@{login}" for login in logins)
+    return f"{names} {'owns' if len(logins) == 1 else 'own'}"
+
+
+def owner_notes(api, pull, changes, head_sha):
+    """Tell the owners of what the change touches, when somebody else opened it.
+
+    A listing's owner is who its host proves on the base branch, a pack's is
+    its accepted owner record, and a state in index-status.toml tells the owner
+    of the listing or pack it names. A new listing or a first pack claim has no
+    owner yet. Only a plain path is looked up, because the path comes from the
+    pull request, and a failed lookup is said and never stops the run.
+    """
+    base_ref = (pull.get("base") or {}).get("ref") or ""
+    if not base_ref:
+        return []
+    user = pull.get("user") or {}
+    author = (user.get("login") or "").lower()
+
+    changed = "which this pull request changes"
+    subjects = []
+    for change in changes:
+        path = change.previous_path or change.path
+        parts = path.split("/")
+        if check_scope.kind_of(path) == check_scope.LISTING_KIND:
+            subjects.append((check_scope.LISTING_KIND, path, changed))
+        elif len(parts) == 3 and parts[0] == "packs":
+            subjects.append((check_scope.PACK_KIND, parts[1], changed))
+    lines = []
+    if any(change.path == STATUS_FILE for change in changes):
+        named, problem = status_subjects(api, base_ref, head_sha)
+        state = f"whose state in `{STATUS_FILE}` this pull request changes"
+        subjects.extend((kind, name, state) for kind, name in named)
+        if problem:
+            lines.append(
+                f"- Nobody is told about the states in `{STATUS_FILE}`, because they could "
+                f"not be read: {problem}."
+            )
+
+    for kind, name, what in dict.fromkeys(subjects):
+        if kind == check_scope.PACK_KIND:
+            if not pack_ownership.OWNER_RECORD.fullmatch(f"packs/{name}/{pack_ownership.OWNER_FILE}"):
+                continue
+            record, reason = pack_ownership.owner_record(api, name, base_ref)
+            if record is None and reason is None:
+                continue
+            if record is not None and record["github_id"] == user.get("id"):
+                continue
+            subject = f"the pack `packs/{name}`"
+            logins = () if record is None else (record["github_login"],)
+        else:
+            if not PLAIN_LISTING.fullmatch(name):
+                continue
+            document, reason = authored_document(api, name, base_ref)
+            if document is None and reason is None:
+                continue
+            subject = f"`{name}`"
+            logins = ()
+            if document is not None:
+                logins, reason = ownership.owner_logins(document, OwnershipApi(api))
+
+        if any(login.lower() == author for login in logins):
+            continue
+        if logins:
+            lines.append(f"- {_mention(logins)} {subject}, {what}.")
+        else:
+            lines.append(
+                f"- Nobody is told about {subject}, because no owner could be named: {reason}."
+            )
+
+    if not lines:
+        return []
+    return ["Owners of what this pull request changes:\n" + "\n".join(lines)]
+
+
 def _named(path, reason):
     """The reason with the document it belongs to, unless it already names it first."""
     return reason if reason.startswith(path) else f"{path}: {reason}"
@@ -720,7 +890,13 @@ def act(api, arguments):
     if checked and verdict.get("verdict") == PASS:
         result = ownership_for_all(api, pull, checked, arguments.head_sha)
 
-    decision = decide({**verdict, "scope_reason": reason}, candidate, result, arguments.run_url)
+    advice = [
+        *owner_advice(pull, pack_ownership.missing_records(api, pull, changes)),
+        *owner_notes(api, pull, changes, arguments.head_sha),
+    ]
+    decision = decide(
+        {**verdict, "scope_reason": reason}, candidate, result, arguments.run_url, advice
+    )
 
     if decision.auto_merge:
         # Auto-merge cannot be armed once GitHub calls the pull request mergeable.
@@ -735,7 +911,7 @@ def act(api, arguments):
                 comment=_comment(
                     "Validated and ownership verified.",
                     verdict,
-                    ["Auto-merge could not be armed, so a steward has to merge this one."],
+                    ["Auto-merge could not be armed, so a steward has to merge this one.", *advice],
                     arguments.run_url,
                 ),
             )

@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 import urllib.error
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -16,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import check_scope
 import decide
 import ownership
+import pack_ownership
 
 WORKFLOWS = Path(__file__).resolve().parent.parent / ".github/workflows"
 
@@ -120,6 +122,7 @@ class RecordingApi:
         self.labels = list(labels)
         self.reviewers = reviewers or {"teams": []}
         self.files = {"listings/AutoStage.toml": LISTING} if files is None else files
+        self.folders = {}
         self.repositories = repositories or {}
         self.spacedock = spacedock or {}
         self.repository_reads = []
@@ -155,6 +158,9 @@ class RecordingApi:
             return self.files[(path, ref)]
         return self.files.get(path)
 
+    def folder(self, path, ref):
+        return self.folders.get((path, ref), [])
+
     # What OwnershipApi forwards to a release host.
     def repository_of(self, full_name):
         self.repository_reads.append(full_name)
@@ -165,6 +171,10 @@ class RecordingApi:
 
     def spacedock_mod(self, mod_id):
         return self.spacedock.get(mod_id)
+
+    def merge_base(self, base_ref, head_sha):
+        # With no merge base set, the pull request is cut from the tip of its base branch.
+        return getattr(self, "merge_base_sha", None) or base_ref
 
     def graphql(self, query, variables):
         self.graphql_calls.append(variables)
@@ -242,14 +252,26 @@ class Table(unittest.TestCase):
         self.assertIn(ownership.MARKER_PATH, decision.comment)
         self.assertIn("source code link", decision.comment)
 
+    def test_the_comment_offers_the_marker_file_only_outside_a_fork(self):
+        # A fork's marker file does not verify it, so the advice must not send
+        # the author of a fork to commit one.
+        decision = decide.decide(verdict(), True, UNVERIFIED)
+        self.assertIn(f"when it is not a fork, commit `{ownership.MARKER_PATH}`", decision.comment)
+        self.assertIn("A fork also passes when your account owns it", decision.comment)
+
+    def test_the_comment_carries_the_advice_of_the_ownership_module(self):
+        # content-index-releases shows ownership.ADVICE too, so both flows say the same.
+        decision = decide.decide(verdict(), True, UNVERIFIED)
+        self.assertIn(ownership.ADVICE, decision.comment)
+
     def test_pack_guidance_does_not_suggest_a_release_host_proof(self):
         result = ownership.Result(
             ownership.UNVERIFIED,
-            "this is the first claim",
-            instructions="A steward must accept the first claim.",
+            "Somebody is not the recorded owner of this pack",
+            instructions="A steward decides whether the recorded pack owner must change.",
         )
         decision = decide.decide(verdict(), True, result)
-        self.assertIn("steward must accept", decision.comment)
+        self.assertIn("recorded pack owner must change", decision.comment)
         self.assertNotIn("release repository", decision.comment)
 
     def test_ownership_that_could_not_be_checked_waits_too(self):
@@ -293,6 +315,53 @@ class Table(unittest.TestCase):
     def test_the_run_url_is_linked_when_given(self):
         decision = decide.decide(verdict("reject"), True, VERIFIED, run_url="https://x/run/1")
         self.assertIn("https://x/run/1", decision.comment)
+
+
+class OwnerAdvice(unittest.TestCase):
+    PATH = "packs/Starter/owner.json"
+
+    def test_a_head_repository_that_is_gone_gets_the_record_without_a_link(self):
+        pull = pull_request()
+        pull["head"]["repo"] = None
+        [paragraph] = decide.owner_advice(pull, [self.PATH])
+        self.assertIn('"github_login": "Maxi"', paragraph)
+        self.assertIn('"github_id": 7', paragraph)
+        self.assertNotIn("https://", paragraph)
+        self.assertIn("no link", paragraph)
+
+    def test_the_branch_name_cannot_leave_the_link(self):
+        [paragraph] = decide.owner_advice(pull_request(branch="a) [b](c d"), [self.PATH])
+        link = re.search(r"\]\((https://[^)\s]+)\)", paragraph).group(1)
+        self.assertEqual(urllib.parse.urlsplit(link).path, f"/{FORK}/new/a%29%20%5Bb%5D%28c%20d")
+
+    def test_a_path_that_is_not_plain_gets_nothing(self):
+        self.assertEqual(decide.owner_advice(pull_request(), ["packs/a`b/owner.json"]), [])
+
+    def test_an_author_without_an_account_id_gets_nothing(self):
+        pull = pull_request()
+        pull["user"] = {"login": "Maxi"}
+        self.assertEqual(decide.owner_advice(pull, [self.PATH]), [])
+
+    def test_the_advice_reaches_the_comment_of_every_outcome(self):
+        cases = [
+            (verdict("reject"), True, UNVERIFIED),
+            (verdict("could-not-evaluate"), True, UNVERIFIED),
+            (verdict(), True, REJECTED),
+            (verdict(), False, UNVERIFIED),
+            (verdict(), True, VERIFIED),
+            (verdict(), True, UNAVAILABLE),
+            (verdict(), True, UNVERIFIED),
+        ]
+        for document, candidate, result in cases:
+            decision = decide.decide(document, candidate, result, "", ["the owner record"])
+            self.assertIn("the owner record", decision.comment)
+
+    def test_checks_run_again_on_every_push_to_a_pull_request(self):
+        # The advice promises that a commit to the head branch runs the checks again.
+        text = (WORKFLOWS / "checks.yml").read_text(encoding="utf-8")
+        trigger = re.search(r"(?m)^on:\n  pull_request:[ \t]*\n((?:    .*\n)*)", text)
+        self.assertIsNotNone(trigger)
+        self.assertEqual(trigger.group(1), "", "the pull_request trigger is narrowed")
 
 
 class Agreement(unittest.TestCase):
@@ -824,13 +893,91 @@ class SpaceDockApi(unittest.TestCase):
         self.assertIn("502", str(raised.exception))
 
     def test_a_network_failure_is_unavailable(self):
-        with self.assertRaises(ownership.Unavailable):
+        with self.assertRaises(ownership.Unavailable) as raised:
             self.fetch(error=OSError("connection reset"))
+        self.assertIn("SpaceDock did not answer about mod 4253", str(raised.exception))
 
     def test_a_body_that_is_not_a_document_is_unavailable(self):
         for body in (b"not json", b"[]", b"null"):
             with self.assertRaises(ownership.Unavailable, msg=body):
                 self.fetch(answer=Answer(body))
+
+
+class FolderApi(unittest.TestCase):
+    """How `Api.folder` lists a folder of the index on a branch."""
+
+    def fetch(self, answer=None, error=None, ref="main"):
+        opener = mock.Mock(side_effect=error) if error else mock.Mock(return_value=answer)
+        api = decide.Api("KSAModding/content-index", "app", public_token="workflow")
+        with mock.patch.object(decide.urllib.request, "urlopen", opener):
+            result = api.folder("packs", ref)
+        return result, opener
+
+    @staticmethod
+    def tree(entries, truncated=False):
+        return Answer(json.dumps({"sha": "t0", "tree": entries, "truncated": truncated}).encode())
+
+    def test_the_entries_come_back_as_names_and_types(self):
+        answer = self.tree([{"path": "Starter", "type": "tree"}, {"path": "README.md", "type": "blob"}])
+        entries, opener = self.fetch(answer=answer)
+        self.assertEqual(entries, [("Starter", "dir"), ("README.md", "file")])
+        request = opener.call_args.args[0]
+        self.assertEqual(
+            request.full_url,
+            "https://api.github.com/repos/KSAModding/content-index/git/trees/main%3Apacks",
+        )
+
+    def test_a_branch_with_a_slash_is_one_path_segment(self):
+        _, opener = self.fetch(answer=self.tree([]), ref="stack/base")
+        self.assertEqual(
+            opener.call_args.args[0].full_url,
+            "https://api.github.com/repos/KSAModding/content-index/git/trees/stack%2Fbase%3Apacks",
+        )
+
+    def test_more_than_a_thousand_entries_are_listed(self):
+        answer = self.tree([{"path": f"p{n}", "type": "tree"} for n in range(1500)])
+        entries, _ = self.fetch(answer=answer)
+        self.assertEqual(len(entries), 1500)
+
+    def test_a_folder_that_is_not_there_has_no_entries(self):
+        entries, _ = self.fetch(error=http_error(404))
+        self.assertEqual(entries, [])
+
+    def test_a_listing_the_api_cut_short_is_unavailable(self):
+        answer = self.tree([{"path": "Starter", "type": "tree"}], truncated=True)
+        with self.assertRaises(ownership.Unavailable):
+            self.fetch(answer=answer)
+
+    def test_a_file_is_not_a_folder(self):
+        with self.assertRaises(ownership.Unavailable):
+            self.fetch(error=http_error(422))
+        with self.assertRaises(ownership.Unavailable):
+            self.fetch(answer=Answer(b'{"sha": "b0", "content": "", "encoding": "base64"}'))
+
+
+class MergeBaseApi(unittest.TestCase):
+    """How `Api.merge_base` asks GitHub where a pull request starts from."""
+
+    def fetch(self, answer=None, error=None):
+        opener = mock.Mock(side_effect=error) if error else mock.Mock(return_value=answer)
+        api = decide.Api("KSAModding/content-index", "app", public_token="workflow")
+        with mock.patch.object(decide.urllib.request, "urlopen", opener):
+            result = api.merge_base("main", "abc1234")
+        return result, opener
+
+    def test_the_merge_base_comes_from_the_comparison(self):
+        body = json.dumps({"merge_base_commit": {"sha": "fork0"}, "files": []})
+        sha, opener = self.fetch(answer=Answer(body.encode()))
+        self.assertEqual(sha, "fork0")
+        self.assertEqual(
+            opener.call_args.args[0].full_url,
+            "https://api.github.com/repos/KSAModding/content-index/compare/main...abc1234?per_page=1",
+        )
+
+    def test_no_merge_base_is_unavailable(self):
+        for answer, error in ((Answer(b"{}"), None), (None, http_error(404)), (None, http_error(502))):
+            with self.assertRaises(ownership.Unavailable):
+                self.fetch(answer=answer, error=error)
 
 
 class AutoMerge(unittest.TestCase):
@@ -959,7 +1106,7 @@ class Act(unittest.TestCase):
         with mock.patch.object(decide.ownership, "verify", lambda *a, **k: VERIFIED):
             self.assertEqual(self.act(), 0)
         self.assertEqual(self.api.graphql_calls, [{"id": "PR_5"}])
-        self.assertEqual([ref for _, _, ref in self.api.reads], ["abc", "main"])
+        self.assertEqual([ref for _, _, ref in self.api.reads][:2], ["abc", "main"])
         self.assertEqual(self.statuses()[-1]["state"], "success")
 
     def test_an_addition_that_the_base_branch_already_carries_is_an_edit(self):
@@ -1128,6 +1275,60 @@ class Act(unittest.TestCase):
         self.assertEqual(self.statuses()[-1]["state"], "failure")
         self.assertEqual(self.api.graphql_calls, [])
 
+    def test_a_first_pack_claim_by_its_author_merges_itself(self):
+        owner_path = "packs/Starter/owner.json"
+        self.api.files = {
+            (owner_path, "abc"): json.dumps({"github_login": "Maxi", "github_id": 7})
+        }
+        with mock.patch.object(
+            decide,
+            "changed_paths",
+            lambda api, number: [
+                check_scope.Change("packs/Starter/1.0.0.toml", "added"),
+                check_scope.Change(owner_path, "added"),
+            ],
+        ):
+            self.assertEqual(self.act(), 0)
+        self.assertEqual(self.api.graphql_calls, [{"id": "PR_5"}])
+        self.assertEqual(self.statuses()[-1]["state"], "success")
+        self.assertEqual(self.labelled(), ["pack"])
+
+    def test_a_first_pack_claim_of_an_id_a_listing_holds_waits(self):
+        owner_path = "packs/Starter/owner.json"
+        self.api.files = {
+            (owner_path, "abc"): json.dumps({"github_login": "Maxi", "github_id": 7})
+        }
+        self.api.folders = {("listings", "main"): [("starter.toml", "file")]}
+        with mock.patch.object(
+            decide,
+            "changed_paths",
+            lambda api, number: [
+                check_scope.Change("packs/Starter/1.0.0.toml", "added"),
+                check_scope.Change(owner_path, "added"),
+            ],
+        ):
+            self.assertEqual(self.act(), 0)
+        self.assertEqual(self.api.graphql_calls, [])
+        self.assertIn(decide.STEWARD_LABEL, self.labelled())
+
+    def test_a_later_version_cannot_change_the_recorded_pack_owner(self):
+        owner_path = "packs/Starter/owner.json"
+        self.api.files = {
+            (owner_path, "main"): json.dumps({"github_login": "Maxi", "github_id": 7}),
+            (owner_path, "abc"): json.dumps({"github_login": "Other", "github_id": 9}),
+        }
+        with mock.patch.object(
+            decide,
+            "changed_paths",
+            lambda api, number: [
+                check_scope.Change("packs/Starter/2.0.0.toml", "added"),
+                check_scope.Change(owner_path, "modified"),
+            ],
+        ):
+            self.assertEqual(self.act(), 0)
+        self.assertEqual(self.api.graphql_calls, [])
+        self.assertIn(decide.STEWARD_LABEL, self.labelled())
+
     def test_the_recorded_pack_owner_can_merge_a_new_version(self):
         owner_path = "packs/Starter/owner.json"
         self.api.files = {
@@ -1141,6 +1342,61 @@ class Act(unittest.TestCase):
             self.assertEqual(self.act(), 0)
         self.assertEqual(self.api.graphql_calls, [{"id": "PR_5"}])
         self.assertEqual(self.statuses()[-1]["state"], "success")
+
+    def pack_claim(self, *changes):
+        with mock.patch.object(
+            decide, "changed_paths",
+            lambda api, number: [check_scope.Change(path, "added") for path in changes],
+        ):
+            self.assertEqual(self.act(verdict("reject")), 0)
+        return [p for _, path, p, _ in self.api.sent if path.endswith("/comments")][0]["body"]
+
+    def test_a_first_pack_claim_without_its_owner_record_gets_the_record_and_a_link(self):
+        self.api.files = {}
+        body = self.pack_claim("packs/Starter/1.0.0.toml")
+
+        text = re.search(r"```json\n(.*?)\n```", body, re.S).group(1) + "\n"
+        record, problem = pack_ownership.parse_record(text, "the comment")
+        self.assertEqual(problem, "")
+        self.assertEqual(record, {"github_login": "Maxi", "github_id": 7})
+
+        link = re.search(r"\]\((https://[^)]+)\)", body).group(1)
+        address = urllib.parse.urlsplit(link)
+        self.assertEqual(address.path, f"/{FORK}/new/{BRANCH}")
+        query = urllib.parse.parse_qs(address.query)
+        self.assertEqual(query["filename"], ["packs/Starter/owner.json"])
+        self.assertEqual(query["value"], [text])
+        self.assertLess(body.index(link), body.index("Push a fix"))
+
+    def test_a_first_pack_claim_with_its_owner_record_gets_no_link(self):
+        self.api.files = {}
+        body = self.pack_claim("packs/Starter/1.0.0.toml", "packs/Starter/owner.json")
+        self.assertNotIn("/new/", body)
+        self.assertNotIn("```json", body)
+
+    def test_a_later_pack_version_gets_no_link(self):
+        self.api.files = {("packs/Starter/owner.json", "main"): json.dumps({"github_login": "Maxi", "github_id": 7})}
+        self.api.folders = {("packs", "main"): [("Starter", "dir")]}
+        body = self.pack_claim("packs/Starter/2.0.0.toml")
+        self.assertNotIn("/new/", body)
+        self.assertNotIn("```json", body)
+
+    def test_a_case_variant_of_a_held_pack_id_gets_no_link(self):
+        self.api.files = {}
+        self.api.folders = {("packs", "main"): [("Starter", "dir")]}
+        body = self.pack_claim("packs/starter/1.0.0.toml")
+        self.assertNotIn("/new/", body)
+        self.assertNotIn("```json", body)
+
+    def test_a_pack_path_that_is_not_plain_still_gets_the_rejection(self):
+        # http.client refuses such a path in a URL, so no read may carry it.
+        self.api.files = {}
+        refused = mock.Mock(side_effect=UnicodeEncodeError("ascii", "", 0, 1, "not ASCII"))
+        with mock.patch.object(self.api, "file", refused):
+            body = self.pack_claim("packs/My Pack/1.0.0.toml", "packs/Caf\u00e9/1.0.0.toml")
+        self.assertIn("The validation rejected this change.", body)
+        self.assertNotIn("```json", body)
+        self.assertEqual(self.statuses()[-1]["state"], "failure")
 
     def test_a_change_that_touches_no_document_carries_no_kind(self):
         with mock.patch.object(
@@ -1165,6 +1421,202 @@ class Act(unittest.TestCase):
         self.assertEqual(self.act(event="workflow_dispatch"), 0)
         self.assertEqual(self.api.sent, [])
         self.assertEqual(self.api.graphql_calls, [])
+
+
+VICTIM_LISTING = 'id = "AutoStage"\n[releases]\ngithub = "Victim/Mod"\n'
+
+
+def personal(full_name, login, account_id):
+    return {full_name: {"full_name": full_name, "fork": False,
+                        "owner": {"id": account_id, "login": login, "type": "User"}}}
+
+
+class OwnerNotes(Act):
+    """The verdict comment mentions whoever owns what somebody else changes."""
+
+    def run_change(self, *changes, outcome=None):
+        with mock.patch.object(decide, "changed_paths", lambda api, number: list(changes)), \
+                mock.patch.object(decide.ownership, "verify", lambda *a, **k: UNVERIFIED):
+            self.assertEqual(self.act(outcome), 0)
+        return [p for _, path, p, _ in self.api.sent if path.endswith("/comments")][0]["body"]
+
+    def edit(self, outcome=None):
+        return self.run_change(check_scope.Change("listings/AutoStage.toml", "modified"), outcome=outcome)
+
+    def status_change(self, base, head):
+        self.api.files = {
+            ("index-status.toml", "main"): base,
+            ("index-status.toml", "abc"): head,
+            ("listings/AutoStage.toml", "main"): VICTIM_LISTING,
+            ("packs/Starter/owner.json", "main"): json.dumps({"github_login": "PackOwner", "github_id": 9}),
+        }
+        self.api.folders = {
+            ("listings", "main"): [("AutoStage.toml", "file"), ("README.md", "file")],
+            ("packs", "main"): [("Starter", "dir"), ("README.md", "file")],
+        }
+        self.api.repositories = personal("Victim/Mod", "Victim", 3)
+        return self.run_change(check_scope.Change("index-status.toml", "modified"))
+
+    def test_a_steward_edit_of_another_persons_listing_mentions_the_owner(self):
+        self.api.files = {("listings/AutoStage.toml", "main"): VICTIM_LISTING,
+                          ("listings/AutoStage.toml", "abc"): VICTIM_LISTING}
+        self.api.repositories = personal("Victim/Mod", "Victim", 3)
+        body = self.edit()
+        self.assertIn(
+            "- @Victim owns `listings/AutoStage.toml`, which this pull request changes.", body
+        )
+
+    def test_the_owners_own_edit_mentions_nobody(self):
+        self.api.repositories = personal("Maxi/KSA-AutoStage", "maxi", 7)
+        body = self.edit()
+        self.assertNotIn("@", body)
+        self.assertNotIn("Owners of", body)
+        # The owner was looked up and found to be the author, not skipped unasked.
+        self.assertEqual(self.api.repository_reads, ["Maxi/KSA-AutoStage"])
+
+    def test_a_renamed_listing_mentions_the_owner_under_its_old_name(self):
+        self.api.files = {("listings/AutoStage.toml", "main"): VICTIM_LISTING}
+        self.api.repositories = personal("Victim/Mod", "Victim", 3)
+        body = self.run_change(
+            check_scope.Change("listings/AutoStage2.toml", "renamed", "listings/AutoStage.toml")
+        )
+        self.assertIn("- @Victim owns `listings/AutoStage.toml`, which this pull request changes.", body)
+
+    def test_a_handover_mentions_the_owner_of_the_host_it_leaves(self):
+        self.api.files = {("listings/AutoStage.toml", "main"): VICTIM_LISTING,
+                          ("listings/AutoStage.toml", "abc"): LISTING}
+        self.api.repositories = {**personal("Victim/Mod", "Victim", 3),
+                                 **personal("Maxi/KSA-AutoStage", "Maxi", 7)}
+        self.assertIn("@Victim owns", self.edit())
+
+    def test_the_mention_is_there_whatever_the_outcome(self):
+        self.api.files = {("listings/AutoStage.toml", "main"): VICTIM_LISTING}
+        self.api.repositories = personal("Victim/Mod", "Victim", 3)
+        self.assertIn("@Victim owns", self.edit(verdict("reject")))
+
+    def test_a_new_listing_mentions_nobody(self):
+        self.api.files = {("listings/AutoStage.toml", "abc"): LISTING}
+        body = self.run_change(check_scope.Change("listings/AutoStage.toml", "added"))
+        self.assertNotIn("Owners of", body)
+
+    def test_no_owner_gives_the_note_and_no_mention(self):
+        self.api.files = {("listings/AutoStage.toml", "main"): VICTIM_LISTING}
+        body = self.edit()
+        self.assertNotIn("@", body)
+        self.assertIn(
+            "- Nobody is told about `listings/AutoStage.toml`, because no owner could be named: "
+            "Victim/Mod does not exist or is private.",
+            body,
+        )
+
+    def test_a_delisting_mentions_the_owner_of_the_delisted_listing(self):
+        body = self.status_change(
+            "entries = []\n",
+            '[[entries]]\nid = "AUTOSTAGE"\nstate = "delisted"\nreason = "Gone."\n',
+        )
+        self.assertIn(
+            "- @Victim owns `listings/AutoStage.toml`, whose state in `index-status.toml` "
+            "this pull request changes.",
+            body,
+        )
+
+    def test_lifting_a_dispute_mentions_the_owner_too(self):
+        body = self.status_change(
+            '[[entries]]\nid = "AutoStage"\nstate = "disputed"\n', "entries = []\n"
+        )
+        self.assertIn("@Victim owns `listings/AutoStage.toml`", body)
+
+    def test_a_state_merged_after_the_branch_was_cut_mentions_nobody(self):
+        # The base branch delisted AutoStage after this pull request was cut from
+        # "fork0", and the pull request changes another entry only.
+        self.api.merge_base_sha = "fork0"
+        self.api.files = {
+            ("index-status.toml", "fork0"): "entries = []\n",
+            ("index-status.toml", "main"): '[[entries]]\nid = "AutoStage"\nstate = "delisted"\n',
+            ("index-status.toml", "abc"): '[[entries]]\nid = "Starter"\nstate = "disputed"\n',
+            ("listings/AutoStage.toml", "main"): VICTIM_LISTING,
+            ("packs/Starter/owner.json", "main"): json.dumps({"github_login": "PackOwner", "github_id": 9}),
+        }
+        self.api.folders = {
+            ("listings", "main"): [("AutoStage.toml", "file")],
+            ("packs", "main"): [("Starter", "dir")],
+        }
+        self.api.repositories = personal("Victim/Mod", "Victim", 3)
+        body = self.run_change(check_scope.Change("index-status.toml", "modified"))
+        self.assertIn("@PackOwner owns the pack `packs/Starter`", body)
+        self.assertNotIn("@Victim", body)
+
+    def test_a_merge_base_that_cannot_be_read_says_nobody_is_told(self):
+        def merge_base(base_ref, head_sha):
+            raise ownership.Unavailable("GitHub names no merge base of main and abc")
+
+        with mock.patch.object(self.api, "merge_base", merge_base):
+            body = self.status_change("entries = []\n", '[[entries]]\nid = "AutoStage"\nstate = "delisted"\n')
+        self.assertIn("Nobody is told about the states in `index-status.toml`", body)
+        self.assertNotIn("@Victim", body)
+
+    def test_a_state_that_stays_mentions_nobody(self):
+        body = self.status_change(
+            '[[entries]]\nid = "AutoStage"\nstate = "disputed"\nreason = "Old."\n',
+            '[[entries]]\nid = "AutoStage"\nstate = "disputed"\nreason = "New."\n',
+        )
+        self.assertNotIn("@", body)
+
+    def test_a_retracted_pack_version_mentions_the_owner_in_owner_json(self):
+        body = self.status_change(
+            "entries = []\n",
+            '[[entries]]\nid = "Starter"\nstate = "retracted"\nversion = "1.0.0"\n',
+        )
+        self.assertIn(
+            "- @PackOwner owns the pack `packs/Starter`, whose state in `index-status.toml` "
+            "this pull request changes.",
+            body,
+        )
+        self.assertNotIn("@Victim", body)
+
+    def test_an_id_that_names_nothing_on_the_base_branch_is_not_echoed(self):
+        body = self.status_change(
+            "entries = []\n", '[[entries]]\nid = "@x **y**"\nstate = "delisted"\n'
+        )
+        self.assertNotIn("**y**", body)
+        self.assertNotIn("Owners of", body)
+
+    def test_a_state_file_that_cannot_be_read_says_nobody_is_told(self):
+        def file(full_name, path, ref=None):
+            raise ownership.Unavailable("HTTP 502 asking for index-status.toml")
+
+        with mock.patch.object(self.api, "file", file):
+            body = self.run_change(check_scope.Change("index-status.toml", "modified"))
+        self.assertIn("Nobody is told about the states in `index-status.toml`", body)
+        self.assertIn("HTTP 502", body)
+
+    def test_a_version_of_somebody_elses_pack_mentions_its_owner(self):
+        self.api.files = {
+            ("packs/Starter/owner.json", "main"): json.dumps({"github_login": "PackOwner", "github_id": 9})
+        }
+        body = self.run_change(check_scope.Change("packs/Starter/2.0.0.toml", "added"))
+        self.assertIn("- @PackOwner owns the pack `packs/Starter`, which this pull request changes.", body)
+
+    def test_the_pack_owner_adding_a_version_mentions_nobody(self):
+        # The account id decides, so a renamed owner is not told about their own change.
+        self.api.files = {
+            ("packs/Starter/owner.json", "main"): json.dumps({"github_login": "OldName", "github_id": 7})
+        }
+        self.api.graphql_answer = {"errors": [{"message": "auto-merge is off"}]}
+        body = self.run_change(check_scope.Change("packs/Starter/2.0.0.toml", "added"))
+        self.assertNotIn("@", body)
+
+    def test_a_path_that_is_not_plain_is_never_looked_up_or_echoed(self):
+        # A rejection runs no ownership check, so every read here is a lookup for a mention.
+        self.api.files = {}
+        body = self.run_change(
+            check_scope.Change("packs/My Pack/1.0.0.toml", "added"),
+            check_scope.Change("listings/Bad`Name.toml", "modified"),
+            outcome=verdict("reject"),
+        )
+        self.assertEqual(self.api.reads, [])
+        self.assertNotIn("My Pack", body)
+        self.assertNotIn("Bad`Name", body)
 
 
 if __name__ == "__main__":

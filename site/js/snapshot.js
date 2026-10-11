@@ -6,11 +6,133 @@ function forumsOf(authored) {
   return authored && authored.links && typeof authored.links === "object" ? authored.links.forums : undefined;
 }
 
+// The time the watcher found the download gone from its host (RFC 0078), or null.
+function goneSince(release) {
+  const since = release.download ? release.download.unavailable_since : undefined;
+  return typeof since === "string" && since ? since : null;
+}
+
+// The newest stable release that a client still offers, so not yanked and with
+// its download still there.
 export function newestStable(releases) {
   const stable = (Array.isArray(releases) ? releases : [])
-    .filter((release) => release && release.release_status === "stable" && !release.yanked && typeof release.version === "string");
+    .filter((release) => release && release.release_status === "stable" && !release.yanked && typeof release.version === "string" && !goneSince(release));
   stable.sort((a, b) => -(semverCompare(a.version, b.version) ?? 0));
   return stable.length ? stable[0].version : null;
+}
+
+function releaseFacts(release) {
+  return {
+    version: release.version,
+    status: typeof release.release_status === "string" ? release.release_status : "",
+    gameMin: typeof release.game_min === "string" ? release.game_min : "",
+    gameMinRevision: Number.isInteger(release.game_min_revision) ? release.game_min_revision : null,
+  };
+}
+
+// The releases a pack can pin, which are stamped, not yanked and still
+// downloadable, newest first.
+export function pinnableReleases(releases) {
+  const kept = (Array.isArray(releases) ? releases : [])
+    .filter((release) => release && !release.yanked && typeof release.version === "string" && !goneSince(release))
+    .map(releaseFacts);
+  kept.sort((a, b) => -(semverCompare(a.version, b.version) ?? 0));
+  return kept;
+}
+
+// The releases a dependency bound can name, which are stamped and not yanked,
+// newest first. A release whose download is gone still counts.
+export function boundReleases(releases) {
+  const kept = (Array.isArray(releases) ? releases : [])
+    .filter((release) => release && !release.yanked && typeof release.version === "string")
+    .map(releaseFacts);
+  kept.sort((a, b) => -(semverCompare(a.version, b.version) ?? 0));
+  return kept;
+}
+
+// The dependencies that the mod.toml of the newest release that is not yanked
+// declares, which the stamper derived, or null when there is no such release.
+// An entry the author bounded is stamped as authored, so it is not among them.
+export function derivedDependencies(releases) {
+  const kept = (Array.isArray(releases) ? releases : [])
+    .filter((release) => release && !release.yanked && typeof release.version === "string");
+  kept.sort((a, b) => -(semverCompare(a.version, b.version) ?? 0));
+  if (!kept.length) return null;
+  const dependencies = (Array.isArray(kept[0].dependencies) ? kept[0].dependencies : [])
+    .filter((entry) => entry && entry.source === "derived" && entry.any_of === undefined && typeof entry.id === "string")
+    .map((entry) => ({ id: entry.id, kind: entry.kind === "optional" ? "optional" : "required" }));
+  return { release: kept[0].version, dependencies };
+}
+
+// The release_status of every stamped release, yanked ones included, because a
+// pin can stay on a release that was yanked after the pack was published.
+export function releaseStatuses(releases) {
+  return new Map((Array.isArray(releases) ? releases : [])
+    .filter((release) => release && typeof release.version === "string")
+    .map((release) => [release.version, typeof release.release_status === "string" ? release.release_status : ""]));
+}
+
+// Every stamped release by its version, yanked ones included, with what the
+// member rules of tools/check_index.py read from its release file.
+function stampedReleases(releases) {
+  return new Map((Array.isArray(releases) ? releases : [])
+    .filter((release) => release && typeof release.version === "string")
+    .map((release) => [release.version, {
+      yanked: release.yanked === true,
+      dependencies: Array.isArray(release.dependencies) ? release.dependencies : [],
+    }]));
+}
+
+// The releases that the picker leaves out only because their download is gone,
+// each with the time it went away. A yanked release is not in this map, because
+// its pin gets the yank note. The mark does not change what a release needs, so
+// the game_min proposal still counts a pin of a gone release.
+function goneReleases(releases) {
+  return new Map((Array.isArray(releases) ? releases : [])
+    .filter((release) => release && !release.yanked && typeof release.version === "string" && goneSince(release))
+    .map((release) => [release.version, { ...releaseFacts(release), since: goneSince(release) }]));
+}
+
+// The facts of a pack's forum member list, found the way Borea finds them. A pin
+// can name a mod or a mod-loader, and a release that was yanked after the pack
+// was published still has its line.
+function forumFacts(listing, authored) {
+  const forums = forumsOf(authored);
+  return {
+    id: listing.id,
+    name: typeof authored.name === "string" ? authored.name : "",
+    authors: Array.isArray(authored.authors) ? authored.authors.filter((author) => typeof author === "string") : [],
+    license: typeof authored.license === "string" ? authored.license : "",
+    forums: typeof forums === "string" ? forums : "",
+    downloads: new Map((Array.isArray(listing.releases) ? listing.releases : [])
+      .filter((release) => release && typeof release.version === "string")
+      .map((release) => [release.version, release.download && typeof release.download.url === "string" ? release.download.url : ""])),
+  };
+}
+
+// A listed mod or loader that a dependency can name, in the words the search
+// matches and with the releases its bounds can name.
+function listedFacts(listing, authored) {
+  return {
+    id: listing.id,
+    name: typeof authored.name === "string" ? authored.name : "",
+    authors: Array.isArray(authored.authors) ? authored.authors.filter((author) => typeof author === "string") : [],
+    loader: authored.type === "mod-loader",
+    releases: boundReleases(listing.releases),
+  };
+}
+
+// Every version of a pack, retracted ones included, highest first.
+function packVersions(versions) {
+  const kept = versions
+    .filter((entry) => entry && entry.authored && typeof entry.authored.version === "string")
+    .map((entry) => ({
+      version: entry.authored.version,
+      releasedAt: typeof entry.authored.released_at === "string" ? entry.authored.released_at : "",
+      retracted: entry.index_status && entry.index_status.state === "retracted" ? entry.index_status : null,
+    }));
+  kept.sort((a, b) => -(semverCompare(a.version, b.version) ?? 0));
+  return kept;
 }
 
 export function indexFacts(snapshot, threadPattern) {
@@ -18,6 +140,12 @@ export function indexFacts(snapshot, threadPattern) {
   const threads = [];
   const loaders = [];
   const mods = [];
+  const members = [];
+  const searchable = [];
+  const declared = new Map();
+  const forum = new Map();
+  const packs = new Map();
+  const listed = new Map();
   for (const listing of Array.isArray(snapshot.listings) ? snapshot.listings : []) {
     if (!listing || typeof listing.id !== "string") continue;
     const folded = listing.id.toLowerCase();
@@ -28,7 +156,17 @@ export function indexFacts(snapshot, threadPattern) {
     const thread = threadOf(threadPattern, forumsOf(authored));
     if (thread !== null) threads.push({ holder: folded, where, thread });
     if (type === "mod-loader") loaders.push({ id: listing.id, newest: newestStable(listing.releases) });
+    if (!declared.has(folded)) declared.set(folded, derivedDependencies(listing.releases));
     if (type === "mod") mods.push(listing.id);
+    const state = listing.index_status && typeof listing.index_status.state === "string" ? listing.index_status.state : null;
+    const delisted = state === "delisted";
+    if (!listed.has(folded)) listed.set(folded, { id: listing.id, type, state, stamped: stampedReleases(listing.releases) });
+    if (type === "mod" && !delisted) {
+      const name = typeof authored.name === "string" ? authored.name : "";
+      members.push({ id: listing.id, name, releases: pinnableReleases(listing.releases), statuses: releaseStatuses(listing.releases), gone: goneReleases(listing.releases) });
+    }
+    if ((type === "mod" || type === "mod-loader") && !delisted && !forum.has(folded)) forum.set(folded, forumFacts(listing, authored));
+    if ((type === "mod" || type === "mod-loader") && !delisted) searchable.push(listedFacts(listing, authored));
   }
   for (const pack of Array.isArray(snapshot.packs) ? snapshot.packs : []) {
     if (!pack || typeof pack.id !== "string") continue;
@@ -45,13 +183,15 @@ export function indexFacts(snapshot, threadPattern) {
       const thread = threadOf(threadPattern, forumsOf(entry && entry.authored));
       if (thread !== null) threads.push({ holder: folded, where, thread });
     }
+    if (!packs.has(folded)) packs.set(folded, { id: pack.id, status: pack.index_status || null, versions: packVersions(versions) });
   }
   const gameVersions = snapshot.game_versions && Array.isArray(snapshot.game_versions.versions)
     ? snapshot.game_versions.versions.filter((version) => typeof version === "string")
     : [];
   loaders.sort((a, b) => a.id.localeCompare(b.id));
   mods.sort((a, b) => a.localeCompare(b));
-  return { holders, threads, threadPattern, loaders, mods, gameVersions };
+  members.sort((a, b) => a.id.localeCompare(b.id));
+  return { holders, threads, threadPattern, loaders, mods, members, listed, searchable, declared, forum, packs, gameVersions };
 }
 
 export function gameVersionChoices(gameVersions) {

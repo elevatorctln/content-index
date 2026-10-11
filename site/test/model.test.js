@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import { parseDocument, writeDocument } from "../js/toml.js";
 import { emptyForm, formFromDocument, documentFromForm } from "../js/model.js";
-import { newFileUrl, editUrl, prefillFromRepository, repositoryApiUrl, URL_LIMIT } from "../js/github.js";
+import { newFileUrl, editUrl, pullRequestLink, copyAndOpen, prefillFromRepository, repositoryApiUrl, listingPath, packPath, documentPath, URL_LIMIT, PASTE_NEW, PASTE_EDIT } from "../js/github.js";
 
 const LISTINGS = new URL("../../listings/", import.meta.url);
 
@@ -98,14 +98,65 @@ test("two release hosts keep the authority, one host drops it", () => {
   assert.deepEqual(documentFromForm(form, null).releases, { github: "a/b" });
 });
 
+test("since is written next to a release host and dropped without one", () => {
+  const form = emptyForm();
+  Object.assign(form, { spacedock: "12", since: " 1.2 " });
+  assert.deepEqual(documentFromForm(form, null).releases, { spacedock: 12, since: "1.2" });
+  form.spacedock = "";
+  assert.equal(documentFromForm(form, null).releases, undefined);
+});
+
+test("since comes back from a loaded listing and is written after the hosts", () => {
+  const text = "[releases]\ngithub = \"a/b\"\nspacedock = 12\nauthority = \"github\"\nsince = \"0.5\"\n";
+  const base = parseDocument(text);
+  const form = formFromDocument(base);
+  assert.equal(form.since, "0.5");
+  const written = writeDocument(documentFromForm(form, base));
+  assert.match(written, /\[releases\]\ngithub = "a\/b"\nspacedock = 12\nauthority = "github"\nsince = "0\.5"\n/);
+});
+
 test("the new-file address carries the file until it gets too long", () => {
-  const short = newFileUrl("MyMod", "id = \"MyMod\"\n");
+  const short = newFileUrl(listingPath("MyMod"), "id = \"MyMod\"\n");
   assert.equal(short.filled, true);
   assert.equal(short.url, "https://github.com/KSAModding/content-index/new/main?filename=listings/MyMod.toml&value=id%20%3D%20%22MyMod%22%0A");
-  const long = newFileUrl("MyMod", "x".repeat(URL_LIMIT));
+  const long = newFileUrl(listingPath("MyMod"), "x".repeat(URL_LIMIT));
   assert.equal(long.filled, false);
   assert.equal(long.url, "https://github.com/KSAModding/content-index/new/main?filename=listings/MyMod.toml");
   assert.equal(editUrl("MyMod"), "https://github.com/KSAModding/content-index/edit/main/listings/MyMod.toml");
+});
+
+test("a new listing gets the plain link and the paste step once the link would pass the limit", () => {
+  const text = fs.readFileSync(new URL("fixtures/StarMap.toml", import.meta.url), "utf8");
+  const plain = "https://github.com/KSAModding/content-index/new/main?filename=listings/StarMap.toml";
+  const filled = `${plain}&value=${encodeURIComponent(text)}`;
+  assert.ok(filled.length > URL_LIMIT && filled.length < 5900, "the fixture sits between the limit and the link GitHub refused");
+  assert.deepEqual(pullRequestLink(listingPath("StarMap"), text), { url: plain, step: PASTE_NEW });
+  const short = "id = \"MyMod\"\n";
+  assert.deepEqual(pullRequestLink(listingPath("MyMod"), short), { url: newFileUrl(listingPath("MyMod"), short).url, step: "" });
+});
+
+test("a changed listing opens the edit page and says to replace the whole file", () => {
+  assert.deepEqual(pullRequestLink(listingPath("MyMod"), "id = \"MyMod\"\n", { id: "MyMod", type: "mod" }), {
+    url: "https://github.com/KSAModding/content-index/edit/main/listings/MyMod.toml",
+    step: PASTE_EDIT,
+  });
+});
+
+test("the button copies the file before it opens GitHub", async () => {
+  const calls = [];
+  const clipboard = { writeText: async (text) => calls.push(["copy", text]) };
+  const tab = { opener: "page" };
+  const open = (url) => calls.push(["open", url]) && tab;
+  assert.deepEqual(await copyAndOpen("https://github.com/x", "id = 1\n", clipboard, open), { copied: true, opened: true });
+  assert.deepEqual(calls, [["copy", "id = 1\n"], ["open", "https://github.com/x"]]);
+  assert.equal(tab.opener, null);
+});
+
+test("GitHub still opens when the browser refuses the clipboard, and a blocked tab is reported", async () => {
+  const refused = { writeText: async () => { throw new Error("NotAllowedError"); } };
+  assert.deepEqual(await copyAndOpen("u", "t", refused, () => ({})), { copied: false, opened: true });
+  assert.deepEqual(await copyAndOpen("u", "t", undefined, () => ({})), { copied: false, opened: true });
+  assert.deepEqual(await copyAndOpen("u", "t", { writeText: async () => {} }, () => null), { copied: true, opened: false });
 });
 
 test("GitHub repository facts fill the form fields", () => {

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { createChecker, licenseErrors, semverCompare, releaseListRules, ERROR, NOTE } from "../js/rules.js";
+import { createChecker, addTag, licenseErrors, semverCompare, releaseListRules, ERROR, NOTE } from "../js/rules.js";
 import { indexFacts, newestStable, gameVersionChoices } from "../js/snapshot.js";
 
 const read = (path) => fs.readFileSync(new URL(path, import.meta.url), "utf8");
@@ -69,6 +69,41 @@ test("a loader must be a mod-loader and a dependency a mod, in the listed spelli
   assert.ok(found.includes("dependencies[0]: 'starmap' is listed as a mod-loader, and a dependency has to be a mod"), found.join("\n"));
 });
 
+test("a pin of a pack, of another spelling or of the same mod twice is an error, as in the index checks", () => {
+  const pack = mod({ type: "modpack", version: "1.0.0", released_at: "2026-09-25T12:00:00Z" });
+  pack.mods = [{ id: "BigPack", version: "1.0.0" }, { id: "othermod", version: "1.0.0" }, { id: "OtherMod", version: "1.1.0" }];
+  const errors = texts(checker.check(pack, { index }), ERROR);
+  assert.deepEqual(errors, [
+    "mods[2]: 'OtherMod' is pinned by mods[1]",
+    "mods[0]: 'BigPack' is itself a pack, and a pack does not nest in spec_version 1",
+    "mods[1]: 'othermod' does not use the canonical id spelling 'OtherMod'",
+  ]);
+});
+
+test("a release time the calendar does not have is an error, as check_schema.check_timestamp says", () => {
+  const verdicts = {
+    "2026-09-31T12:00:00Z": false,
+    "2026-02-29T12:00:00Z": false,
+    "1900-02-29T12:00:00Z": false,
+    "0000-01-01T00:00:00Z": false,
+    "2026-00-01T00:00:00Z": false,
+    "2026-13-01T00:00:00Z": false,
+    "2026-01-00T00:00:00Z": false,
+    "2026-01-01T24:00:00Z": false,
+    "2026-01-01T23:60:00Z": false,
+    "2026-01-01T23:59:60Z": false,
+    "2024-02-29T12:00:00Z": true,
+    "2000-02-29T12:00:00Z": true,
+    "0001-01-01T00:00:00Z": true,
+    "2026-12-31T23:59:59.1234567891Z": true,
+  };
+  for (const [value, real] of Object.entries(verdicts)) {
+    const pack = mod({ type: "modpack", version: "1.0.0", released_at: value, mods: [{ id: "OtherMod", version: "1.0.0" }] });
+    const errors = texts(checker.check(pack, { index }), ERROR);
+    assert.deepEqual(errors, real ? [] : [`released_at: '${value}' is not a real date and time`], value);
+  }
+});
+
 test("a forums thread another listing names gives a note, by thread id", () => {
   const found = texts(checker.check(mod({ links: { forums: "https://forums.ahwoo.com/index.php?threads/other.500/" } }), { index }), NOTE);
   assert.deepEqual(found, [
@@ -108,6 +143,17 @@ test("SemVer precedence follows SemVer 2.0.0", () => {
   assert.equal(semverCompare("v1.0.0", "1.0.0"), null);
 });
 
+test("a version with one or two numbers is filled with zero before it is compared", () => {
+  assert.equal(semverCompare("0.5", "0.5.0"), 0);
+  assert.equal(semverCompare("1", "1.0.0"), 0);
+  assert.equal(semverCompare("0.5", "0.5.1"), -1);
+  assert.equal(semverCompare("2", "1.9.9"), 1);
+  assert.equal(semverCompare("1.2-rc.1", "1.2.0"), -1);
+  assert.equal(semverCompare("1.2+build.7", "1.2.0"), 0);
+  assert.equal(semverCompare("0.5.0.1", "0.5.0"), null);
+  assert.equal(semverCompare("", "0.5.0"), null);
+});
+
 test("license texts match the Python check", () => {
   assert.deepEqual(licenseErrors("MIT OR Apache-2.0"), []);
   assert.deepEqual(licenseErrors("MIT WITH LicenseRef-x"), []);
@@ -140,4 +186,37 @@ test("a schema message is placed at the field it names", () => {
   const missing = found.find((entry) => entry.text === "'forums' is a required property");
   assert.equal(missing.path, "links");
   assert.equal(missing.field, "links.forums");
+});
+
+function addAll(entries, tags = []) {
+  for (const entry of entries) {
+    const added = addTag(tags, entry, checker.tagPattern);
+    assert.equal(added.error, null, entry);
+    tags = added.tags;
+  }
+  return tags;
+}
+
+test("a typed tag is stored in its lowercase form", () => {
+  assert.deepEqual(addAll(["Physics", "Space Station", "  RCS "]), ["physics", "space-station", "rcs"]);
+  assert.deepEqual(addAll(["-Big_ _Engines-", "x2-engine"]), ["big-engines", "x2-engine"]);
+});
+
+test("a typed curated tag in another case selects the curated tag", () => {
+  const tags = addAll(["Gameplay"]);
+  assert.deepEqual(tags, ["gameplay"]);
+  assert.ok(tags.every((tag) => checker.curated.includes(tag)));
+});
+
+test("a typed tag that is already there is not added twice", () => {
+  assert.deepEqual(addAll(["Physics"], ["physics"]), ["physics"]);
+  assert.deepEqual(addAll(["", "   "], ["physics"]), ["physics"]);
+});
+
+test("an entry that cannot become a tag is refused with its name", () => {
+  for (const entry of ["C++", "Space - Station", "---"]) {
+    const added = addTag(["physics"], ` ${entry} `, checker.tagPattern);
+    assert.deepEqual(added.tags, ["physics"]);
+    assert.equal(added.error, `'${entry}' cannot be a tag. A tag is lowercase letters and digits in words joined by -, such as space-station.`);
+  }
 });

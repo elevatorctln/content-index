@@ -53,9 +53,23 @@ For a legal takedown of the files themselves, the release host's own process is 
 The index then delists the listing on the rights holder's request, or once the host has removed the files.
 Scrubbing this repository's history is a separate and heavier operation, done only when it is legally required.
 
+## Leaving a pack
+
+A pack pins only listed mods, and the author of a pinned mod can ask to leave the pack, per [RFC 0080](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0080-pack-claims-and-members.md).
+What happens:
+
+1. The mod author files a [takedown](https://github.com/KSAModding/content-index/issues/new?template=takedown.yml) that names the pack and the mod. A steward checks that the request comes from the owner of the mod's listing, by the ownership proof the listing uses or by its forums account.
+2. The pack author publishes a new pack version without the mod, through the ordinary pull request.
+3. A steward retracts every accepted version of the pack that pins the mod, with one `retracted` entry per version and a reason that names the request.
+
+The steward does step 3 also when the pack author does not answer.
+A pack whose versions are all retracted stays listed, and its next version brings it back.
+A retracted version stays installed where it is, and a client stops offering it, as for a yanked release.
+
 ## Filing an id dispute
 
 The id is the folder name the game installs a mod as, so two mods cannot share one, and the index gives an id to the first pull request that claims it and verifies.
+A pack id is given the same way, and a squatted pack id, such as a generic `StarterPack`, is an id dispute like any other.
 
 Use the [id dispute form](https://github.com/KSAModding/content-index/issues/new?template=id-dispute.yml) when a listed id is one you believe is yours, or when the ownership of a listing is contested, for example after a handover.
 
@@ -77,6 +91,15 @@ When the dispute fails, the `disputed` entry is removed again and the listing st
 A pull request that validates but cannot prove that its author controls the release host gets the `needs-steward` label and a review request to the stewards team, with a comment that says why.
 
 A steward merges such a pull request by hand after checking what the automation could not.
+
+## Who is told
+
+When somebody other than the owner opens a pull request that changes a listing or a pack, for example a steward edit or a handover, the bot's comment on it mentions the owner with `@login`.
+A pull request that sets or lifts a state in `index-status.toml` mentions the owner of every listing or pack it names.
+The owner of a listing is the account that its ownership proof names, as in [CONTRIBUTING.md](CONTRIBUTING.md#proving-you-control-the-release-host), and the owner of a pack is the account in `packs/<id>/owner.json`.
+When no owner can be named, the comment says so and mentions nobody.
+The bot mentions and does not assign, because GitHub assigns only people with access to this repository.
+A mention subscribes the owner to that one pull request, and they can unsubscribe from it on its page.
 
 ## Response expectations and escalation
 

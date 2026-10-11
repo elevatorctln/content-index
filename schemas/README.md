@@ -1,6 +1,6 @@
 # Schemas
 
-`authored.schema.json` is the machine-readable form of the authored document defined by [RFC 0031](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0031-content-metadata-format.md) and extended by [RFC 0035](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0035-content-install-descriptor.md), [RFC 0049](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0049-instance-handover.md), [RFC 0058](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0058-listing-images-and-dates.md) and [RFC 0067](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0067-per-platform-launch.md), and amended by [RFC 0065](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0065-icon-center-crop.md).
+`authored.schema.json` is the machine-readable form of the authored document defined by [RFC 0031](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0031-content-metadata-format.md) and extended by [RFC 0035](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0035-content-install-descriptor.md), [RFC 0049](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0049-instance-handover.md), [RFC 0058](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0058-listing-images-and-dates.md) and [RFC 0067](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0067-per-platform-launch.md), and amended by [RFC 0065](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0065-icon-center-crop.md), [RFC 0072](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0072-version-forms.md) and [RFC 0079](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0079-author-freedom.md).
 
 It is JSON Schema 2020-12, and it covers all three types the format defines today: `mod`, `mod-loader` and `modpack`.
 
@@ -74,11 +74,39 @@ The platform names are `windows`, `linux` and `macos`.
 Each entry needs `launch`, a path relative to the loader's install location, and can add `runtime = "dotnet"`, which starts `dotnet` with `launch` as its first argument.
 A platform without an entry starts `[provides].launch`, so the table is valid only next to it.
 
+## Version bounds
+
+A `min` or `max` on `[loader]`, on a dependency entry, or on an `any_of` alternative is a version with one, two or three numbers, per RFC 0072.
+A missing number reads as `0`, so `0.5` is `0.5.0` and `1` is `1.0.0`.
+The SemVer 2.0.0 pre-release and build parts are allowed, as in `1.2-rc.1`.
+Four numbers, a leading zero, and a leading `v` are refused.
+
+The pack `version` and the `version` of a pin keep all three numbers, because they name a release as the index stores it.
+
+## Older releases
+
+`[releases]` can carry `since`, a version in the same forms as a bound, per [RFC 0079](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0079-author-freedom.md):
+
+```toml
+[releases]
+github = "owner/repository"
+since = "1.2"
+```
+
+The watcher in content-index-releases then also stamps every release of the authority host whose version is at least `since` and that has no release file yet.
+Without `since`, it stamps the newest release of a new listing and every release after it.
+`since` names no host, so it does not count toward the hosts that make `authority` required, `[releases]` with only `since` is refused, and `tools/ownership.py` reads the authority without it.
+A change of `since` alone is not a change of release host.
+
+An older release is stamped with the listing facts that stand when it is stamped, so a bound written for the newest release lands on it too.
+The owner corrects the facts of an old release with an amendment in content-index-releases, which may make the release stricter or wider.
+A lower `since` stamps more releases, and a higher one removes none.
+
 ## What the schema does not cover
 
 Some rules cannot be expressed in JSON Schema at all. `check_schema.py` applies these after the schema passes:
 
-- a `max` below its `min`, on `[loader]`, on a dependency entry, and on an `any_of` alternative,
+- a `max` below its `min`, on `[loader]`, on a dependency entry, and on an `any_of` alternative, compared after a short bound is filled with `0`,
 - a `game_max` older than its `game_min`, where both name a revision or both name a month. RFC 0017 makes a month bound the first and last revision of that calendar month, and revisions ascend across the shipped history, so calendar order is revision order. A month against a revision stays uncomparable here: resolving it needs the game release list, which lives in the generated repository,
 - a `released_at` that matches the shape but names no real moment, such as `2026-13-45T12:00:00Z`,
 - unbalanced parentheses in a `license` expression,
@@ -96,6 +124,9 @@ Some rules need more than the document, and belong to the checks around it:
 | A changed document has an `abstract` of at most 280 characters | `tools/check_index.py` warns only. RFC 0031 calls the abstract one or two sentences, and a longer one breaks list views. |
 | The document sits at the path its id and type say | `tools/check_layout.py` |
 | `[loader].id` references content of type `mod-loader`, a dependency id references a `mod`, and a pack member is not itself a pack | `tools/check_index.py` |
+| Each pin of a changed pack version names a listed `mod` that is not delisted, at a stamped release that is not yanked, and `[[vehicles]]` and `[[saves]]` stay empty | `tools/check_index.py`, against the release files of the generated repository, per [RFC 0080](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0080-pack-claims-and-members.md) |
+| The pins of a changed pack version are a complete set: every `required` dependency of a pinned release names another pinned mod inside its bounds, one member of an `any_of` is enough, and no `conflict` entry matches another pinned mod | `tools/check_index.py`, from the dependencies in the stamped release files, so a derived entry counts like an authored one |
+| A pin of a changed pack version names a `disputed` mod | `tools/check_index.py` warns only, because RFC 0080 lets a disputed member pass and a client warns about it |
 | A named `any_of` member carried `Optional = true` in the archive's own `mod.toml` | the stamper ([content-index-releases#13](https://github.com/KSAModding/content-index-releases/issues/13)), which is the only place the archive is read |
 | `[provides].launch` and the `launch` of each `[provides.platform]` entry name a file the release actually contains | the stamper |
 | `install.root` is derivable, and the archive downloads and hashes | `tools/check_release.py`, which reaches the answer by running the stamper against the real archive rather than by repeating its rules |
@@ -106,7 +137,34 @@ Some rules need more than the document, and belong to the checks around it:
 | Each image of a changed document downloads safely and matches its record | `tools/check_images.py` with the document path, by the fetch rules of RFC 0058 |
 | An image record's `license` names identifiers on the SPDX list | `tools/check_license.py` |
 | An id in `index-status.toml` names a listing or a pack that exists, and a retracted version exists on that pack | `tools/check_status.py` |
-| The author controls the release host, or owns the pack id | the ownership workflow ([#4](https://github.com/KSAModding/content-index/issues/4)); pack ownership is read from the steward-owned `packs/<id>/owner.json` on the base branch |
+| The author controls the release host, or owns the pack id | the ownership workflow ([#4](https://github.com/KSAModding/content-index/issues/4)); pack ownership is read from `packs/<id>/owner.json` on the base branch by numeric account id, or from the pull request for a first claim, which adds the owner record together with the first version of an id that no listing or pack on the base branch holds in any case |
+
+## Pack member vectors
+
+`pack-vectors.json` holds small cases of the pack member rules of RFC 0080, with the result that `check_index.check_members` and `check_index.member_notes` give.
+`tools/test_check_index.py` writes each mini snapshot into a temporary index and release folder and runs the checks, and `site/test/pack-vectors.test.js` runs the same cases through the listing page.
+Borea is to hold a copy of the file and run it in its own tests ([Borea#567](https://github.com/KSAModding/Borea/issues/567)), so once that lands, a change here needs the same change there.
+
+The file is an object with one key, `vectors`, a list of cases.
+Each case has these keys:
+
+| Key | What it holds |
+|---|---|
+| `name` | What the case shows. Unique in the file. |
+| `snapshot` | The mini snapshot the case runs against, see below. |
+| `pack` | The text of the pack version document, in TOML. |
+| `accepted` | `true` when the member rules give no error. |
+| `errors` | Every error, in order, as `<section>[<n>]: <message>`. The checks put the path of the pack file in front, and a vector leaves it out. |
+| `notes` | Every warning, in the same form. A note does not refuse the pack. |
+| `adds` | Optional. The pins that "Add the missing dependencies" of the listing page appends, each as `id` and `version`, in order. Absent means none. With them appended, the pack has no error. |
+
+The mini snapshot has these keys:
+
+| Key | What it holds |
+|---|---|
+| `listings` | Each listing as `id`, `type` and `releases`. `releases` holds the stamped release files of the listing, with only the fields the rules read: `version`, `release_status`, and where the case needs them `yanked`, `dependencies` and `download`. A bound of a dependency is full SemVer, as the stamper writes it, so a runner can read the releases as release files without a stamping step. A case can also carry other fields of a release file, such as `yanked_reason` or the `source` of a dependency, which the rules do not read. |
+| `delisted` | Optional. The ids that `index-status.toml` delists. In a real snapshot such a listing is a tombstone. |
+| `disputed` | Optional. The ids that `index-status.toml` marks disputed. In a real snapshot such a listing ships whole, with `index_status.state` set to `disputed`. |
 
 ## Where the schema is stricter than the RFC text
 
@@ -122,12 +180,12 @@ They are collected here so any one of them can be argued down on its own.
 | A `mod` may not set `install.path`, and may only set `install.target = "mods"` | RFC 0035: "a mod's install location is not the author's to choose in the first place", because the folder name is the identity `Mod.MakeUsing` assigns. |
 | A `modpack` may not carry `[releases]`, `[loader]` or `[[dependencies]]` | RFC 0031 lists these under what a pack does not have, and RFC 0035 already makes `[install]` on a pack invalid. A section that does nothing is a section its author believed in. |
 | A `mod-loader` carrying `[install]` must state `target` | RFC 0035's Relationship section claims every RFC 0031 file stays valid, but its own table requires `target` on a type with no default, and `mod-loader` has none. The normative table wins. |
-| Authored SemVer bounds reject a leading `v` | Only a release tag gets its `v` stripped, and that happens at stamp time. An authored bound is not a tag. |
+| Authored version bounds reject a leading `v` | Only a release tag gets its `v` stripped, and that happens at stamp time. An authored bound is not a tag. |
 | Game bounds reject a suffix or a `+hash`, take a four-digit year, and take a month of 1 to 12 | RFC 0017 puts builds carrying a suffix outside the compatibility model, and a bound has to resolve to a revision. |
 | An `any_of` entry may not carry `min` or `max` of its own | RFC 0031 puts the bounds on each alternative. An outer pair would have no defined meaning against a set. |
 | A path may not run through a reserved Windows device name | Not in any RFC. A segment naming `NUL` or `CON` swallows every write on Windows, so a manager writing `[provides.configure]` there reports success and configures nothing, which is the failure that section exists to prevent. |
 | A `[provides.instance]` key may not carry a Unicode control character, U+0000 to U+001F or U+007F to U+009F | RFC 0049 forbids only whitespace. A manager hands the value to a process start as an argument or a variable name, where a control character that is not whitespace, such as a NUL, cuts the value short or makes the start fail. The paths and keys elsewhere in the schema exclude the control characters below U+0020 for the same reason. |
-| `[releases]` must name at least one host | A section carrying only `authority` names an authority for nothing. Implied by RFC 0031 rather than stated. |
+| `[releases]` must name at least one host | A section carrying only `authority` or `since` names an authority or a first release for nothing. Implied by RFC 0031 rather than stated. |
 | `tags` are lowercase, and a word or words joined by `-` | RFC 0031 says "free-form lowercase tags". The casing is the RFC's; the separator is this schema's, so a filter list cannot end up holding both `user-interface` and `user_interface`. |
 | `[[mods]]` and `authors` need at least one entry, and `name`, `abstract` and `changelog` may not be empty | A required field present but empty is the same absence with none of the reporting. |
 

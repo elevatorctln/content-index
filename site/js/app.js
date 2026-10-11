@@ -1,16 +1,28 @@
-import { createChecker, ERROR, NOTE, ABSTRACT_LIMIT } from "./rules.js";
+import { createChecker, addTag, ERROR, NOTE, ABSTRACT_LIMIT } from "./rules.js";
 import { parseDocument, writeDocument } from "./toml.js";
 import { indexFacts, gameVersionChoices, SNAPSHOT_URL } from "./snapshot.js";
-import { emptyForm, emptyRecord, formFromDocument, documentFromForm, isFixedLink, KINDS, PLATFORMS } from "./model.js";
+import { emptyForm, emptyRecord, formFromDocument, documentFromForm, isFixedLink, sectionsOf, nounOf, releaseTime, PLATFORMS } from "./model.js";
 import { measure, readCapped, LIMITS, MEASURE_FACTOR, ICON, DESCRIPTION } from "./images.js";
 import { renderPreview } from "./markdown.js";
-import { zipNames, inspectArchive, StampError } from "./archive.js";
-import { newFileUrl, editUrl, rawListingUrl, repositoryApiUrl, prefillFromRepository, listingPath } from "./github.js";
+import { inspectArchive, StampError } from "./archive.js";
+import {
+  pullRequestLink, copyAndOpen, rawListingUrl, rawPackUrl, rawOwnerUrl, repositoryApiUrl, prefillFromRepository, listingPath, packPath, ownerPath, documentPath,
+} from "./github.js";
+import {
+  TEXTS, kindText, kindChoices, isListedLoader, boundChoices, newestBound, canNeedNewest, canAddBounds, dependencyCandidates,
+  dependencyMatches, addDependency, dependencyNotes, readArchive as readZip, declaredFor,
+} from "./dependencies.js";
+import {
+  memberChoices, versionChoices, defaultVersion, pinNotes, gameMinNotes, packOf, ownIds, nextPackForm, freeVersion, newerNotes, nextVersionNotes, forumLines,
+  memberMessages, missingDependencies,
+} from "./pack.js";
+import { isLogin, userApiUrl, ownerRecordText, accountFromAnswer, packIdState, firstClaimText, FREE } from "./owner.js";
 
 const STORAGE_KEY = "ksa-listing-page/v1";
 const TIMEOUT = 20000;
 const SECTION_INPUTS = { links: "link-forums", compatibility: "game-min" };
-const MANUAL = new Set(["msg-load", "msg-prefill", "msg-output", "msg-pr", "archive-result"]);
+const MANUAL = new Set(["msg-load", "msg-prefill", "msg-output", "msg-pr", "msg-forum-list", "msg-owner", "msg-owner-file", "msg-members-fix", "archive-result", "msg-declared"]);
+const ROW_MESSAGES = ["link", "dependency", "member"];
 
 const $ = (id) => document.getElementById(id);
 
@@ -20,13 +32,22 @@ let snapshotState = "loading";
 let state = { mode: "new", baseText: null, base: null, form: emptyForm() };
 const measured = new WeakMap();
 const tickets = new WeakMap();
-let archiveNames = null;
+// The release zip the author selected, which the install root checks and the
+// dependencies read.
+let archiveFile = null;
 let archiveTicket = null;
+// The line of reading the selected zip while it reads or when it fails.
+let zipStatus = null;
+let loaderSetText = null;
+let selectedMatch = null;
 let current = { document: {}, text: "", messages: [] };
 let saveTimer = null;
 const touched = new Set();
 let tagsTouched = false;
+let tagError = null;
 let needsLoader = false;
+let ownerCheck = null;
+let ownerTicket = null;
 
 function element(tag, attributes = {}, children = []) {
   const node = document.createElement(tag);
@@ -94,6 +115,7 @@ const FIELDS = {
   github: ["github"],
   spacedock: ["spacedock"],
   authority: ["authority"],
+  since: ["since"],
   name: ["name"],
   authors: ["authors"],
   abstract: ["abstract"],
@@ -113,6 +135,9 @@ const FIELDS = {
   launch: ["launch"],
   "content-dir": ["contentDir"],
   "content-path": ["contentPath"],
+  version: ["version"],
+  "released-at": ["releasedAt"],
+  changelog: ["changelog"],
 };
 
 function readPath(path) {
@@ -171,12 +196,53 @@ function bindStatic() {
     refresh();
     $("dependencies").lastElementChild.querySelector("input").focus();
   });
+  $("dependency-search").addEventListener("input", renderDependencyMatches);
+  $("dependency-search").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      addListedDependency();
+    }
+  });
+  $("dependency-matches").addEventListener("change", (event) => {
+    selectedMatch = event.target.value;
+    $("add-listed-dependency").disabled = !selectedMatch;
+  });
+  $("add-listed-dependency").addEventListener("click", addListedDependency);
+  $("add-member").addEventListener("click", () => {
+    state.form.members.push({ id: "", version: "" });
+    renderMembers();
+    refresh();
+    $("members").lastElementChild.querySelector("select").focus();
+  });
+  $("add-missing").addEventListener("click", addMissing);
+  $("released-now").addEventListener("click", () => {
+    state.form.releasedAt = releaseTime();
+    touched.add($("released-at"));
+    renderFields();
+    refresh();
+  });
+  $("copy-forum-list").addEventListener("click", copyForumList);
+  $("owner-check").addEventListener("click", checkOwner);
+  $("owner-login").addEventListener("input", renderOwner);
+  $("owner-login").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      checkOwner();
+    }
+  });
+  $("copy-owner").addEventListener("click", () => copyText("msg-owner-file", ownerRecordText(ownerCheck.account), "owner.json", "file", "Copied."));
+  $("save-owner").addEventListener("click", () => download("owner.json", ownerRecordText(ownerCheck.account), "application/json"));
   $("add-tag").addEventListener("click", addFreeTag);
   $("tag-input").addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       event.preventDefault();
       addFreeTag();
     }
+  });
+  $("tag-input").addEventListener("input", () => {
+    if (!tagError) return;
+    tagError = null;
+    refresh();
   });
   $("add-icon").addEventListener("click", () => {
     state.form.icon = emptyRecord(false);
@@ -215,9 +281,8 @@ function bindStatic() {
       // Nothing to clear when storage is blocked.
     }
     state = { mode: "new", baseText: null, base: null, form: emptyForm() };
-    archiveNames = null;
-    archiveTicket = null;
-    $("archive").value = "";
+    forgetArchive();
+    clearTagEntry();
     say("archive-result");
     say("msg-load");
     say("msg-prefill");
@@ -235,13 +300,28 @@ function setMode(mode) {
   refresh();
 }
 
+function loadedBase() {
+  return state.mode === "edit" ? state.base : null;
+}
+
+function packBase() {
+  const base = loadedBase();
+  return base && base.type === "modpack" ? base : null;
+}
+
 function renderMode() {
   const editing = state.mode === "edit";
+  const base = loadedBase();
+  const pack = packBase();
   for (const radio of document.querySelectorAll("input[name=mode]")) radio.checked = radio.value === state.mode;
   $("load").hidden = !editing;
-  $("id").readOnly = editing && Boolean(state.base);
-  $("editing").hidden = !(editing && state.base);
-  $("editing").textContent = editing && state.base ? `Changing ${listingPath(state.form.id)}. The id cannot change.` : "";
+  $("id").readOnly = Boolean(base);
+  // A listing cannot become a pack, or a pack a listing, because each lives at a path of its own.
+  for (const option of $("type").options) option.disabled = Boolean(base) && (option.value === "modpack") !== Boolean(pack);
+  $("editing").hidden = !base;
+  $("editing").textContent = pack
+    ? `Making the next version of the pack ${pack.id} after ${pack.version}. It is a new file, and the id cannot change.`
+    : base ? `Changing ${listingPath(state.form.id)}. The id cannot change.` : "";
 }
 
 function renderFields() {
@@ -285,9 +365,19 @@ function renderLoader() {
 }
 
 function renderTypeSections() {
-  const loader = state.form.type === "mod-loader";
-  $("loader-block").hidden = loader;
-  $("launch-section").hidden = !loader;
+  const shown = sectionsOf(state.form.type);
+  $("releases-section").hidden = !shown.releases;
+  $("loader-block").hidden = !shown.loader;
+  $("launch-section").hidden = !shown.launch;
+  $("dependencies-section").hidden = !shown.dependencies;
+  $("pack-section").hidden = !shown.pack;
+  $("members-section").hidden = !shown.members;
+  $("listing-steps").hidden = shown.pack;
+  $("pack-steps").hidden = !shown.pack;
+  for (const word of document.querySelectorAll(".noun")) word.textContent = nounOf(state.form.type);
+  for (const part of document.querySelectorAll(".not-pack")) part.hidden = shown.pack;
+  // The topic note of a prefill is about a release host, which a pack does not have.
+  $("organization-note").hidden = shown.pack || !$("organization-note").textContent;
 }
 
 function inputField(label, value, onInput, attributes = {}, action = null) {
@@ -302,15 +392,21 @@ function inputField(label, value, onInput, attributes = {}, action = null) {
   return element("div", { className: "field grow" }, [element("label", { for: id, text: label }), control]);
 }
 
-function selectField(label, value, options, onChange) {
+function selectField(label, value, options, onChange, action = null) {
   const id = `f${Math.random().toString(36).slice(2)}`;
-  const select = element("select", { id }, options.map(([optionValue, text]) => element("option", { value: optionValue, text })));
-  select.value = value;
+  const select = element("select", { id });
+  fillSelect(select, options, value);
   select.addEventListener("change", () => {
     onChange(select.value);
     refresh();
   });
-  return element("div", { className: "field grow" }, [element("label", { for: id, text: label }), select]);
+  const control = action ? element("div", { className: "postfix" }, [select, action]) : select;
+  return element("div", { className: "field grow" }, [element("label", { for: id, text: label }), control]);
+}
+
+function fillSelect(select, options, value) {
+  select.replaceChildren(...options.map(([optionValue, text]) => element("option", { value: optionValue, text })));
+  select.value = value;
 }
 
 function removeButton(label, onClick) {
@@ -368,16 +464,173 @@ function renderDependencies() {
         messages,
       ]);
     }
-    return element("div", { className: "item" }, [
-      element("div", { className: "row compact" }, [
-        inputField("Id", entry.id, (value) => { entry.id = value; }, { list: "mod-ids" }),
-        selectField("Kind", entry.kind || "required", KINDS.map((kind) => [kind, kind]), (value) => { entry.kind = value; }),
-        inputField("Oldest version (optional)", entry.min, (value) => { entry.min = value; }),
-        inputField("Newest version (optional)", entry.max, (value) => { entry.max = value; }, {}, remove),
-      ]),
-      messages,
-    ]);
+    return dependencyRow(entry, remove, messages);
   }));
+}
+
+// The versions offer the stamped releases of the named mod and still take any
+// text. A line under the fields says what the kind does.
+function dependencyRow(entry, remove, messages) {
+  const listId = `f${Math.random().toString(36).slice(2)}`;
+  const versions = element("datalist", { id: listId });
+  const kindLine = element("p", { className: "hint" });
+  const min = inputField("Oldest version (optional)", entry.min, (value) => { entry.min = value; });
+  const max = inputField("Newest version (optional)", entry.max, (value) => { entry.max = value; }, {}, remove);
+  const needsNewest = element("button", {
+    type: "button",
+    className: "link",
+    text: TEXTS.needsNewest,
+    title: TEXTS.needsNewestHint,
+    onclick: () => {
+      const newest = newestBound(index, entry.id);
+      if (!newest) return;
+      entry.min = newest;
+      min.querySelector("input").value = newest;
+      refresh();
+    },
+  });
+  const fit = () => {
+    const choices = boundChoices(index, entry.id);
+    versions.replaceChildren(...choices.map((choice) =>
+      element("option", { value: choice.version, label: choice.status ? `${choice.version} (${choice.status})` : undefined })));
+    for (const field of [min, max]) {
+      const input = field.querySelector("input");
+      if (choices.length) input.setAttribute("list", listId);
+      else input.removeAttribute("list");
+    }
+    needsNewest.hidden = !canNeedNewest(index, entry);
+    const text = kindText(entry.kind || "required");
+    kindLine.textContent = text || "";
+    kindLine.hidden = !text;
+  };
+  const id = inputField("Id", entry.id, (value) => {
+    entry.id = value;
+    fit();
+  }, { list: "mod-ids" });
+  const kind = selectField("Kind", entry.kind || "required", kindChoices(entry.kind).map((choice) => [choice, choice]), (value) => {
+    entry.kind = value;
+    fit();
+  });
+  fit();
+  return element("div", { className: "item" }, [
+    element("div", { className: "row compact" }, [id, kind, min, needsNewest, max]),
+    versions,
+    kindLine,
+    messages,
+  ]);
+}
+
+// Adds an entry for the id, or makes a listed loader the loader of the mod.
+function addEntry(id, kind) {
+  const loader = addDependency(state.form, index, id, kind);
+  loaderSetText = loader ? TEXTS.loaderSet(loader) : null;
+  if (loader) {
+    needsLoader = true;
+    renderLoaderOptions();
+    renderFields();
+    renderLoader();
+  } else {
+    renderDependencies();
+  }
+  refresh();
+}
+
+function addListedDependency() {
+  if (!selectedMatch) return;
+  const id = selectedMatch;
+  $("dependency-search").value = "";
+  addEntry(id, "required");
+}
+
+function renderDependencyMatches() {
+  const query = $("dependency-search").value;
+  const matches = dependencyMatches(index, state.form, query);
+  if (!matches.some((listing) => listing.id === selectedMatch)) selectedMatch = matches.length ? matches[0].id : null;
+  $("dependency-matches").replaceChildren(...matches.map((listing) => element("label", { className: "match" }, [
+    element("input", { type: "radio", name: "dependency-match", value: listing.id, checked: listing.id === selectedMatch }),
+    element("span", { className: "match-text" }, [
+      element("span", { className: "match-name" }, [
+        element("strong", { text: listing.name || listing.id }),
+        ...(listing.loader ? [" ", element("span", { className: "tag", text: "Mod loader" })] : []),
+      ]),
+      element("span", { className: "match-id", text: listing.id }),
+    ]),
+    element("span", { className: "hint", text: listing.authors.length ? `by ${listing.authors.join(", ")}` : "" }),
+  ])));
+  $("dependency-matches").hidden = !matches.length;
+  $("dependency-no-match").hidden = !(query.trim() && !matches.length && dependencyCandidates(index, state.form).length);
+  $("add-listed-dependency").disabled = !selectedMatch;
+  $("loader-set").textContent = loaderSetText || "";
+  $("loader-set").hidden = !loaderSetText;
+}
+
+function renderDeclared() {
+  const base = loadedBase();
+  const help = declaredFor({
+    document: current.document,
+    index,
+    base: base && !packBase() ? base : null,
+    archive: archiveFile,
+  });
+  const declared = help.declared;
+  $("declared").hidden = !help.shown;
+  $("declared-text").hidden = !declared;
+  $("declared-text").textContent = !declared ? "" : declared.dependencies.length ? TEXTS.declared(declared.of) : TEXTS.declaredNone(declared.of);
+  $("declared-list").replaceChildren(...(declared ? declared.dependencies : []).map((dependency) => {
+    const parts = [element("span", { text: dependency.kind === "optional" ? TEXTS.optional(dependency.id) : TEXTS.required(dependency.id) })];
+    if (isListedLoader(index, dependency.id)) parts.push(element("span", { className: "tag", text: "Mod loader" }));
+    if (canAddBounds(state.form, dependency.id)) {
+      parts.push(element("button", { type: "button", className: "link", text: "Add bounds", onclick: () => addEntry(dependency.id, dependency.kind) }));
+    }
+    return element("li", {}, parts);
+  }));
+  $("declared-pending").hidden = !help.pending;
+  $("msg-declared").replaceChildren(...(help.read ? [help.read[0] ? line(...help.read) : element("p", { className: "hint", text: help.read[1] })] : []));
+}
+
+function renderMembers() {
+  $("add-member").disabled = !index;
+  $("members-state").hidden = Boolean(index);
+  $("members-state").textContent = snapshotState === "loading"
+    ? "The members come from the index snapshot, which is still loading."
+    : "The index snapshot did not load, so the page cannot offer members. Reload the page to try again.";
+  $("members").replaceChildren(...state.form.members.map((entry, number) => {
+    const remove = removeButton("Remove this member", () => {
+      state.form.members.splice(number, 1);
+      renderMembers();
+      refresh();
+    });
+    const messages = element("div", { className: "messages", "aria-live": "polite", "data-member": number });
+    if (entry.kept !== undefined) {
+      return element("div", { className: "item" }, [
+        element("div", { className: "item-head" }, [element("p", { className: "hint", text: "A pin the page cannot show, kept as it is." }), remove]),
+        messages,
+      ]);
+    }
+    const releases = () => [["", "Choose a release"], ...versionChoices(index, entry.id, entry.version)];
+    const version = selectField("Release", entry.version, releases(), (value) => {
+      entry.version = value;
+    }, remove);
+    const mod = selectField("Mod", entry.id, [["", "Choose a mod"], ...memberChoices(index, entry.id)], (value) => {
+      entry.id = value;
+      entry.version = defaultVersion(index, value);
+      fillSelect(version.querySelector("select"), releases(), entry.version);
+    });
+    return element("div", { className: "item" }, [element("div", { className: "row" }, [mod, version]), messages]);
+  }));
+}
+
+function addMissing() {
+  const { pins } = missingDependencies(current.document, index);
+  state.form.members.push(...pins.map(({ id, version }) => ({ id, version })));
+  renderMembers();
+  refresh();
+}
+
+function renderMemberFix() {
+  const { pins, notes } = missingDependencies(current.document, index);
+  $("add-missing").hidden = !pins.length;
+  $("msg-members-fix").replaceChildren(...notes.map((text) => line(NOTE, text)));
 }
 
 function renderTags() {
@@ -417,13 +670,22 @@ function renderTags() {
 }
 
 function addFreeTag() {
-  const tag = $("tag-input").value.trim();
+  if (!checker) return;
   tagsTouched = true;
-  if (!tag) return;
-  if (!state.form.tags.includes(tag)) state.form.tags.push(tag);
-  $("tag-input").value = "";
+  const added = addTag(state.form.tags, $("tag-input").value, checker.tagPattern);
+  tagError = added.error;
+  if (!tagError) {
+    state.form.tags = added.tags;
+    $("tag-input").value = "";
+  }
   renderTags();
   refresh();
+}
+
+// A refused entry belongs to the form it was typed in, so a new or loaded form starts without it.
+function clearTagEntry() {
+  tagError = null;
+  $("tag-input").value = "";
 }
 
 function describeRecord(record) {
@@ -532,7 +794,7 @@ function imageEditor(record, role, place, title, onRemove) {
     fetchMessages,
     element("div", { className: "measure" }, [preview, facts]),
     element("div", { className: "row" }, [
-      inputField("License of the image (optional)", record.license, (value) => { record.license = value; }, { placeholder: "the mod's license", "data-field": `${place}.license` }),
+      inputField("License of the image (optional)", record.license, (value) => { record.license = value; }, { placeholder: "the license of the listing", "data-field": `${place}.license` }),
       inputField("Credit (optional)", record.attribution, (value) => { record.attribution = value; }, { "data-field": `${place}.attribution` }),
     ]),
     inputField("Address of the original work (optional)", record.source, (value) => { record.source = value; }, { type: "url", "data-field": `${place}.source` }),
@@ -628,8 +890,13 @@ function place(entry) {
     }
     const dependency = /^dependencies\[(\d+)\]$/.exec(path);
     if (dependency) {
-      const number = dependencyRows()[Number(dependency[1])];
+      const number = filledRows(state.form.dependencies)[Number(dependency[1])];
       if (number !== undefined) return $("dependencies").querySelector(`[data-dependency="${number}"]`);
+    }
+    const member = /^mods\[(\d+)\]$/.exec(path);
+    if (member) {
+      const number = filledRows(state.form.members)[Number(member[1])];
+      if (number !== undefined) return $("members").querySelector(`[data-member="${number}"]`);
     }
     const target = $(`msg-${path}`);
     if (target) return target;
@@ -637,9 +904,10 @@ function place(entry) {
   return null;
 }
 
-function dependencyRows() {
+// The written document leaves out a row without an id, so its index differs from the form's.
+function filledRows(entries) {
   const rows = [];
-  state.form.dependencies.forEach((entry, number) => {
+  entries.forEach((entry, number) => {
     if (entry.kept !== undefined || entry.id.trim()) rows.push(number);
   });
   return rows;
@@ -659,8 +927,9 @@ function extraMessages() {
     const facts = measured.get(record);
     for (const problem of facts ? facts.problems : []) found.push({ level: ERROR, path: where, text: problem });
   }
-  if (archiveNames) {
-    for (const problem of inspectArchive(archiveNames, current.document).problems) {
+  if (tagError) found.push({ level: ERROR, path: "tags", text: tagError });
+  if (archiveFile && current.document.type !== "modpack") {
+    for (const problem of inspectArchive(archiveFile.names, current.document).problems) {
       found.push({ level: ERROR, path: "archive", text: problem });
     }
   }
@@ -669,7 +938,7 @@ function extraMessages() {
 
 function renderMessages() {
   for (const container of document.querySelectorAll(".messages")) {
-    const checked = container.id ? !MANUAL.has(container.id) : container.dataset.link !== undefined || container.dataset.dependency !== undefined;
+    const checked = container.id ? !MANUAL.has(container.id) : ROW_MESSAGES.some((name) => container.dataset[name] !== undefined);
     if (checked) container.replaceChildren();
   }
   for (const input of document.querySelectorAll("[aria-invalid]")) input.removeAttribute("aria-invalid");
@@ -680,8 +949,17 @@ function renderMessages() {
     if (entry.path === "the document" && input && !input.value && !touched.has(input)) continue;
     if (entry.path === "tags" && entry.level === NOTE && !tagsTouched) continue;
     target.append(line(entry.level, REQUIRED.test(entry.text) ? "Required." : entry.text));
+    if (entry.newer && entry.fits) target.append(element("button", { type: "button", text: `Pin ${entry.newer}`, onclick: () => movePin(entry.path, entry.newer) }));
     if (entry.level === ERROR && input) input.setAttribute("aria-invalid", "true");
   }
+}
+
+function movePin(path, version) {
+  const number = filledRows(state.form.members)[Number(/^mods\[(\d+)\]$/.exec(path)[1])];
+  if (number === undefined) return;
+  state.form.members[number].version = version;
+  renderMembers();
+  refresh();
 }
 
 function invalidInput(entry, target) {
@@ -692,8 +970,8 @@ function invalidInput(entry, target) {
       .find((node) => node.getAttribute("aria-describedby").split(" ").includes(target.id));
     if (described) return described;
   }
-  if (target.dataset.link !== undefined || target.dataset.dependency !== undefined) {
-    return target.closest(".item").querySelector("input");
+  if (ROW_MESSAGES.some((name) => target.dataset[name] !== undefined)) {
+    return target.closest(".item").querySelector("input, select");
   }
   return null;
 }
@@ -704,6 +982,7 @@ const REQUIRED = /^'([^']+)' is a required property$/;
 const MISSING_NAMES = {
   id: "Id", name: "Name", authors: "Authors", abstract: "Abstract", license: "License",
   links: "Forums thread", forums: "Forums thread", compatibility: "Oldest game version", game_min: "Oldest game version",
+  version: "Pack version", released_at: "Release time", mods: "Members",
 };
 
 function renderSummary() {
@@ -766,7 +1045,7 @@ function renderCard() {
   ]);
   const authors = form.authors.split(",").map((name) => name.trim()).filter(Boolean);
   const title = element("p", { className: "card-title" }, [
-    element("span", { className: "card-name", text: form.name.trim() || form.id.trim() || "Your mod" }),
+    element("span", { className: "card-name", text: form.name.trim() || form.id.trim() || (form.type === "modpack" ? "Your pack" : "Your mod") }),
   ]);
   if (authors.length) title.append(" ", element("span", { className: "card-by", text: `by ${authors.join(", ")}` }));
   const body = element("div", { className: "card-body" }, [
@@ -795,7 +1074,7 @@ function renderSections() {
     const title = heading.textContent.trim();
     const shown = section.querySelectorAll(".msg.error").length;
     const filled = [...section.querySelectorAll("input, select, textarea")].some((field) =>
-      field.type === "checkbox" ? field.checked : field.type !== "file" && field.type !== "radio" && field.value.trim() && field.tagName !== "SELECT")
+      !field.closest("[hidden]") && (field.type === "checkbox" ? field.checked : field.type !== "file" && field.type !== "radio" && field.type !== "search" && field.value.trim() && field.tagName !== "SELECT"))
       || section.querySelector(".item, [aria-pressed=true]") !== null;
     const count = errors.get(section) || 0;
     const kind = count && shown ? "fix" : count ? "open" : filled ? "done" : "optional";
@@ -816,38 +1095,55 @@ function renderSections() {
 function renderOutput() {
   $("output").value = current.text;
   $("output").rows = Math.max(6, current.text.split("\n").length + 1);
-  $("output-label").textContent = listingPath(current.document.id || "<id>");
+  $("output-label").textContent = documentPath(current.document);
   const blocked = current.messages.some((entry) => entry.level === ERROR) || !current.document.id;
   const link = $("open-pr");
   link.setAttribute("aria-disabled", blocked ? "true" : "false");
   link.classList.toggle("disabled", blocked);
-  link.textContent = state.mode === "edit" && state.base ? "Open the edit page on GitHub" : "Open pull request on GitHub";
-  if (state.mode === "edit" && state.base) {
-    link.href = editUrl(state.base.id);
-  } else {
-    link.href = newFileUrl(String(current.document.id || ""), current.text).url;
-  }
+  link.textContent = loadedBase() && !packBase() ? "Open the edit page on GitHub" : "Open pull request on GitHub";
+  const { url, step } = currentLink();
+  link.href = url;
+  $("pr-step").textContent = step;
+  $("pr-step").hidden = blocked || !step;
+}
+
+function currentLink() {
+  return pullRequestLink(documentPath(current.document, encodeURIComponent), current.text, loadedBase());
 }
 
 function refresh() {
   if (!checker) return;
-  const own = state.mode === "edit" && state.base ? state.base.id : null;
-  current.document = documentFromForm(state.form, state.mode === "edit" ? state.base : null);
+  const base = loadedBase();
+  const { own, pack } = ownIds(base);
+  current.document = documentFromForm(state.form, base);
   current.text = writeDocument(current.document);
   current.messages = checker.check(current.document, { index, own, gameVersions: index ? index.gameVersions : null });
-  current.messages.push(...extraMessages());
+  current.messages.push(
+    ...extraMessages(),
+    ...memberMessages(current.document, index),
+    ...pinNotes(current.document, index),
+    ...gameMinNotes(current.document, index),
+    ...newerNotes(current.document, index),
+    ...nextVersionNotes(current.document, index, pack),
+    ...dependencyNotes(current.document, index, checker.validId),
+  );
   const explained = new Set(current.messages.filter((entry) => SPDX_DETAIL.test(entry.text)).map((entry) => entry.path));
   current.messages = current.messages.filter((entry) => !(explained.has(entry.path) && SPDX_SHAPE.test(entry.text)));
   const count = Array.from(state.form.abstract.trim()).length;
   $("abstract-count").textContent = `${count} of ${ABSTRACT_LIMIT}.`;
   $("authority-field").hidden = !(state.form.github.trim() && state.form.spacedock.trim());
+  $("since-field").hidden = !(state.form.github.trim() || state.form.spacedock.trim());
   renderMessages();
+  renderMemberFix();
+  renderDeclared();
+  renderDependencyMatches();
   renderSummary();
   renderCard();
   renderSections();
   renderOutput();
   renderArchiveResult();
   renderDescriptionPreview();
+  renderOwner();
   persist();
 }
 
@@ -861,15 +1157,16 @@ function renderAll() {
   renderExtraLinks();
   renderPlatforms();
   renderDependencies();
+  renderMembers();
   renderTags();
   renderImages();
   refresh();
 }
 
-async function fetchListing(id) {
+async function fetchRaw(url, path) {
   try {
-    const response = await fetch(rawListingUrl(id), { cache: "no-store", signal: AbortSignal.timeout(TIMEOUT) });
-    if (response.status === 404) return { error: `There is no ${listingPath(id)} on main.` };
+    const response = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(TIMEOUT) });
+    if (response.status === 404) return { error: `There is no ${path} on main.`, missing: true };
     if (!response.ok) return { error: `GitHub answered HTTP ${response.status}.` };
     return { text: await response.text() };
   } catch {
@@ -877,8 +1174,18 @@ async function fetchListing(id) {
   }
 }
 
+function fetchListing(id) {
+  return fetchRaw(rawListingUrl(id), listingPath(id));
+}
+
+async function packVersionTaken(id, version) {
+  const answer = await fetchRaw(rawPackUrl(id, version), packPath(id, version));
+  if (answer.error && !answer.missing) throw new Error(answer.error);
+  return !answer.missing;
+}
+
 async function checkBase() {
-  if (state.mode !== "edit" || !state.base) return;
+  if (state.mode !== "edit" || !state.base || packBase()) return;
   const { base, baseText } = state;
   const answer = await fetchListing(base.id);
   if (state.base !== base || answer.text === baseText) return;
@@ -903,27 +1210,66 @@ async function loadListing() {
     return;
   }
   const holder = index && index.holders.get(typed.toLowerCase());
+  if (holder && holder.type === "modpack") {
+    await loadPack(holder.id);
+    return;
+  }
   const id = holder ? holder.id : typed;
   say("msg-load", null, `Loading ${listingPath(id)}.`);
   const answer = await fetchListing(id);
   if (answer.error) {
+    // Only the snapshot tells a pack id from a listing id.
+    say("msg-load", ERROR, answer.missing && !index ? `${answer.error} A pack loads once the index snapshot has loaded.` : answer.error);
+    return;
+  }
+  const base = parseBase(answer.text, "listing");
+  if (base) useBase(answer.text, base, formFromDocument(base), `Loaded ${listingPath(id)}.`);
+}
+
+function parseBase(text, kind) {
+  try {
+    return parseDocument(text);
+  } catch (error) {
+    say("msg-load", ERROR, `The ${kind} is not valid TOML: ${error.message}`);
+    return null;
+  }
+}
+
+function useBase(text, base, form, loaded) {
+  state = { mode: "edit", baseText: text, base, form };
+  forgetArchive();
+  clearTagEntry();
+  say("msg-load", null, loaded);
+  renderAll();
+}
+
+// The newest version is the base, and the next version is raised above every
+// version file on main, retracted ones included.
+async function loadPack(id) {
+  const pack = packOf(index, id);
+  if (!pack || !pack.versions.length) {
+    say("msg-load", ERROR, `The index snapshot has no version of the pack ${id}.`);
+    return;
+  }
+  const newest = pack.versions[0].version;
+  say("msg-load", null, `Loading ${packPath(id, newest)}.`);
+  const answer = await fetchRaw(rawPackUrl(id, newest), packPath(id, newest));
+  if (answer.error) {
     say("msg-load", ERROR, answer.error);
     return;
   }
-  const text = answer.text;
-  let base;
+  const base = parseBase(answer.text, "pack version");
+  if (!base) return;
+  const form = nextPackForm(base, pack);
+  let loaded = `Loaded ${packPath(id, newest)}. The next version is ${form.version}.`;
   try {
-    base = parseDocument(text);
+    const free = await freeVersion(form.version, (version) => packVersionTaken(id, version));
+    if (free && free !== form.version) loaded = `Loaded ${packPath(id, newest)}. Main already has ${form.version}, so the next version is ${free}.`;
+    form.version = free || form.version;
   } catch (error) {
-    say("msg-load", ERROR, `The listing is not valid TOML: ${error.message}`);
-    return;
+    loaded += ` The page could not check that main has no such file yet, and checks it again before the pull request. ${error.message}`;
   }
-  state = { mode: "edit", baseText: text, base, form: formFromDocument(base) };
-  archiveNames = null;
-  archiveTicket = null;
-  $("archive").value = "";
-  say("msg-load", null, `Loaded ${listingPath(id)}.`);
-  renderAll();
+  useBase(answer.text, base, form, loaded);
 }
 
 async function prefill() {
@@ -967,12 +1313,12 @@ async function prefill() {
   fill("bug tracker", ["links", "bugtracker"], facts.bugtracker);
   renderFields();
   const notes = [filled.length ? `Filled ${filled.join(", ")}. Check each value.` : "Nothing to fill, the fields already have values."];
-  if (facts.fork) notes.push("The repository is a fork, so the first ownership proof, a repository in your own account, does not apply.");
+  if (facts.fork) notes.push("The repository is a fork, so it proves ownership through its owner or the topic, not through a marker file. Give the listing an id of its own, because the original listing keeps its id.");
   say("msg-prefill", null, notes.join(" "));
-  $("organization-note").hidden = !facts.organization;
   $("organization-note").textContent = facts.organization
     ? `${facts.owner} is an organization. Add the topic ksa-index-<your-github-username>, in lowercase, to ${repository}, or ask an owner of ${facts.owner} to add it.`
     : "";
+  renderTypeSections();
   refresh();
 }
 
@@ -980,32 +1326,43 @@ async function readArchive() {
   const file = $("archive").files && $("archive").files[0];
   const ticket = {};
   archiveTicket = ticket;
-  archiveNames = null;
-  if (!file) {
-    say("archive-result");
-    refresh();
-    return;
-  }
-  say("archive-result", null, "Reading the archive.");
+  archiveFile = null;
+  zipStatus = file ? [null, "Reading the archive."] : null;
   refresh();
-  let names;
+  if (!file) return;
+  let archive;
   try {
-    names = await zipNames(file);
+    archive = await readZip(file);
   } catch (error) {
     if (archiveTicket === ticket) {
-      say("archive-result", ERROR, error instanceof StampError ? error.message : `the archive cannot be read, ${error.message}`);
+      zipStatus = [ERROR, error instanceof StampError ? error.message : `the archive cannot be read, ${error.message}`];
+      refresh();
     }
     return;
   }
   if (archiveTicket !== ticket) return;
-  archiveNames = names;
+  archiveFile = { ...archive, fileName: file.name };
+  zipStatus = null;
   refresh();
 }
 
+// Forgets the selected zip and what it declared, for a new or a loaded form.
+function forgetArchive() {
+  archiveFile = null;
+  archiveTicket = null;
+  zipStatus = null;
+  $("archive").value = "";
+  loaderSetText = null;
+  $("dependency-search").value = "";
+}
+
 function renderArchiveResult() {
-  if (!archiveNames) return;
-  const result = inspectArchive(archiveNames, current.document);
-  const lines = [];
+  const lines = zipStatus ? [line(...zipStatus)] : [];
+  if (!archiveFile) {
+    $("archive-result").replaceChildren(...lines);
+    return;
+  }
+  const result = inspectArchive(archiveFile.names, current.document);
   if (result.root !== null) {
     const where = result.root ? `'${result.root}'` : "the archive root";
     const matches = current.document.type === "mod" && result.root === current.document.id;
@@ -1016,23 +1373,31 @@ function renderArchiveResult() {
   $("archive-result").replaceChildren(...lines);
 }
 
+const COPY_REFUSED = "The browser did not allow copying. The file is selected, copy it by hand.";
+
 async function copyOutput(target) {
   try {
     await navigator.clipboard.writeText(current.text);
     say(target, null, "Copied.");
-    return true;
   } catch {
-    $("output").focus();
-    $("output").select();
-    say(target, NOTE, "The browser did not allow copying. The file is selected, copy it by hand.");
-    return false;
+    selectOutput();
+    say(target, NOTE, COPY_REFUSED);
   }
 }
 
+function selectOutput() {
+  $("output").focus();
+  $("output").select();
+}
+
 function saveOutput() {
-  const blob = new Blob([current.text], { type: "application/toml" });
-  const url = URL.createObjectURL(blob);
-  const anchor = element("a", { href: url, download: `${current.document.id || "listing"}.toml` });
+  const name = current.document.type === "modpack" ? current.document.version || "version" : current.document.id || "listing";
+  download(`${name}.toml`, current.text, "application/toml");
+}
+
+function download(name, text, type) {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const anchor = element("a", { href: url, download: name });
   document.body.append(anchor);
   anchor.click();
   anchor.remove();
@@ -1045,16 +1410,132 @@ async function openPullRequest(event) {
     say("msg-pr", ERROR, current.document.id ? "Fix the errors first. You can still copy or save the file." : "Give the id first.");
     return;
   }
-  const editing = state.mode === "edit" && state.base;
-  const filled = !editing && newFileUrl(String(current.document.id), current.text).filled;
-  const copied = await copyOutput("msg-pr");
-  if (editing) {
-    say("msg-pr", null, `${copied ? "The file is copied." : ""} In the GitHub editor, select all the text and paste the file over it.`);
-  } else if (!filled) {
-    say("msg-pr", null, `${copied ? "The file is copied." : ""} It is too long to fill in by the address, so paste it into the GitHub editor.`);
-  } else {
-    say("msg-pr", null, `${copied ? "The file is also copied, " : ""}in case GitHub does not fill it in.`);
+  event.preventDefault();
+  if (packBase() && !(await versionStillFree())) return;
+  const { url, step } = currentLink();
+  const { copied, opened } = await copyAndOpen(url, current.text, navigator.clipboard, (address) => window.open(address, "_blank"));
+  const lines = [];
+  if (copied) {
+    lines.push(line(null, step ? "The file is copied." : "The file is also copied, in case GitHub does not fill it in."));
+  } else if (step) {
+    selectOutput();
+    lines.push(line(NOTE, COPY_REFUSED));
   }
+  if (!opened) {
+    const note = line(NOTE, "The browser blocked the new tab. ");
+    note.append(element("a", { href: url, target: "_blank", rel: "noopener noreferrer", text: "Open GitHub" }), ".");
+    lines.push(note);
+  }
+  $("msg-pr").replaceChildren(...lines);
+}
+
+// A version merged since the pack was loaded takes the proposed path, so the
+// version is raised again and the author sees the new file before it opens.
+async function versionStillFree() {
+  const { id, version } = current.document;
+  let free;
+  try {
+    free = await freeVersion(version, (proposed) => packVersionTaken(id, proposed));
+  } catch {
+    return true;
+  }
+  if (free === version) return true;
+  if (free) {
+    state.form.version = free;
+    renderFields();
+    refresh();
+  }
+  say("msg-pr", NOTE, free
+    ? `Main already has ${packPath(id, version)}, so the version is now ${free}. Check the file and open the pull request again.`
+    : `Main already has ${packPath(id, version)}. Choose a higher version.`);
+  return false;
+}
+
+async function copyForumList() {
+  if (!index) {
+    say("msg-forum-list", ERROR, "The list comes from the index snapshot, which has not loaded.");
+    return;
+  }
+  const lines = forumLines(current.document, index);
+  if (!lines.length) {
+    say("msg-forum-list", ERROR, "Add a member first.");
+    return;
+  }
+  if (lines.includes(null)) {
+    say("msg-forum-list", ERROR, "Choose a release for every member first.");
+    return;
+  }
+  await copyText("msg-forum-list", lines.join("\n"), "Member list", "list", "Copied. Paste it into the first post of your forum thread.");
+}
+
+async function copyText(target, text, label, noun, done) {
+  try {
+    await navigator.clipboard.writeText(text);
+    say(target, null, done);
+  } catch {
+    const box = element("textarea", { readonly: true, spellcheck: "false", "aria-label": label, rows: text.split("\n").length + 1, text });
+    $(target).replaceChildren(line(NOTE, `The browser did not allow copying. The ${noun} is selected, copy it by hand.`), box);
+    box.focus();
+    box.select();
+  }
+}
+
+async function lookupAccount(login) {
+  try {
+    const response = await fetch(userApiUrl(login), {
+      headers: { Accept: "application/vnd.github+json" }, cache: "no-store", signal: AbortSignal.timeout(TIMEOUT),
+    });
+    return accountFromAnswer(login, response.status, response.ok ? await response.json() : null);
+  } catch {
+    return accountFromAnswer(login, null, null);
+  }
+}
+
+// The id and the login of a check both come from the form, so a check that
+// either has moved away from is no longer shown.
+async function checkOwner() {
+  const id = current.document.id;
+  const login = $("owner-login").value.trim();
+  if (!id) {
+    say("msg-owner", ERROR, "Give the id of the pack first.");
+    return;
+  }
+  if (!isLogin(login)) {
+    say("msg-owner", ERROR, login ? `'${login}' is not a GitHub login.` : "Give your GitHub login first.");
+    return;
+  }
+  const ticket = {};
+  ownerTicket = ticket;
+  ownerCheck = null;
+  say("msg-owner-file");
+  renderOwner();
+  say("msg-owner", null, "Asking GitHub.");
+  const [recorded, lookup] = await Promise.all([fetchRaw(rawOwnerUrl(id), ownerPath(id)), lookupAccount(login)]);
+  if (ownerTicket !== ticket || current.document.id !== id || $("owner-login").value.trim() !== login) {
+    if (ownerTicket === ticket) say("msg-owner");
+    return;
+  }
+  const answer = packIdState(id, index, recorded, lookup.account);
+  ownerCheck = { id, login, state: answer.state, account: lookup.account };
+  $("msg-owner").replaceChildren(line(answer.level, answer.text), ...(lookup.account ? [] : [line(lookup.level, lookup.text)]));
+  renderOwner();
+}
+
+function renderOwner() {
+  if (ownerCheck && (ownerCheck.id !== current.document.id || ownerCheck.login !== $("owner-login").value.trim())) {
+    ownerCheck = null;
+    ownerTicket = null;
+    say("msg-owner");
+    say("msg-owner-file");
+  }
+  const claim = Boolean(ownerCheck) && ownerCheck.state === FREE;
+  $("owner-claim").hidden = !claim;
+  if (!claim) return;
+  $("owner-claim-text").textContent = ownerCheck.account
+    ? `${firstClaimText(ownerCheck.id)} You can also copy or save the file now.`
+    : firstClaimText(ownerCheck.id);
+  $("copy-owner").hidden = !ownerCheck.account;
+  $("save-owner").hidden = !ownerCheck.account;
 }
 
 async function loadText(url) {
@@ -1108,6 +1589,7 @@ async function loadSnapshot() {
     index = null;
     snapshotState = "failed";
     status("The index snapshot did not load. The page still checks the file, but not the id against the listed ids.");
+    renderMembers();
     refresh();
     return;
   }
@@ -1117,6 +1599,8 @@ async function loadSnapshot() {
   if (newest) $("game-min").placeholder = newest;
   $("mod-ids").replaceChildren(...index.mods.map((id) => element("option", { value: id })));
   renderLoaderOptions();
+  renderDependencies();
+  renderMembers();
   refresh();
 }
 

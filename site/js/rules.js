@@ -12,9 +12,11 @@ export const ABSTRACT_LIMIT = 280;
 export const TAGS_SPEC = "https://github.com/KSAModding/content-manager-design/blob/main/spec/tags.md";
 const SPDX_LIST = "https://spdx.org/licenses/";
 const TAG_VOCABULARY = { mod: "mod", "mod-loader": "mod", modpack: "mod" };
+const PINNED_SECTIONS = ["mods", "vehicles", "saves"];
 
 const REVISION_BOUND = /^[0-9]{4}\.[0-9]+\.[0-9]+\.([0-9]+)(?![\s\S])/;
 const MONTH_BOUND = /^([0-9]{4})\.([0-9]+)(?![\s\S])/;
+const TIMESTAMP = /^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})/;
 const GAME_VERSION = /^v?(\d+)\.(\d+)\.(\d+)\.(\d+)(?:-[^+]+)?(?:\+.*)?$/;
 const LICENSE_REF = /^(?:DocumentRef-[A-Za-z0-9.-]+:)?LicenseRef-[A-Za-z0-9.-]+(?![\s\S])/;
 const THREAD_ID = "[0-9]+";
@@ -175,19 +177,59 @@ export function schemaMessages(validate, document) {
   return found;
 }
 
+// One or more decimal digits of any script, as str.isdecimal of Python reads them.
+const DECIMAL = /^\p{Nd}+$/u;
+const DIGIT = /^\p{Nd}$/u;
+
+// Unicode gives the decimal digits only in runs of ten from 0 to 9, so the
+// place of a digit in its run is its value.
+function digitValue(character) {
+  let code = character.codePointAt(0);
+  if (code >= 0x30 && code <= 0x39) return code - 0x30;
+  let place = 0;
+  while (DIGIT.test(String.fromCodePoint(code - 1))) {
+    code -= 1;
+    place += 1;
+  }
+  return place % 10;
+}
+
+function decimal(text) {
+  let value = 0n;
+  for (const character of text) value = value * 10n + BigInt(digitValue(character));
+  return value;
+}
+
+function compareCodePoints(left, right) {
+  const a = Array.from(left);
+  const b = Array.from(right);
+  for (let index = 0; index < Math.min(a.length, b.length); index += 1) {
+    const x = a[index].codePointAt(0);
+    const y = b[index].codePointAt(0);
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
+}
+
+// The sort key that semver_key of check_schema.py gives a version, or null
+// when it does not read the version. The numbers can have any size.
+function semverKey(version) {
+  if (typeof version !== "string") return null;
+  const withoutBuild = version.split("+")[0];
+  const dash = withoutBuild.indexOf("-");
+  const core = dash < 0 ? withoutBuild : withoutBuild.slice(0, dash);
+  const pre = dash < 0 ? "" : withoutBuild.slice(dash + 1);
+  const numbers = core.split(".");
+  if (numbers.length > 3 || !numbers.every((part) => DECIMAL.test(part))) return null;
+  // RFC 0072: a missing number reads as 0, so 0.5 and 0.5.0 are the same version.
+  while (numbers.length < 3) numbers.push("0");
+  const identifiers = pre ? pre.split(".").map((part) => (DECIMAL.test(part) ? { number: decimal(part) } : { text: part })) : null;
+  return { core: numbers.map(decimal), pre: identifiers };
+}
+
 export function semverCompare(left, right) {
-  const key = (version) => {
-    if (typeof version !== "string") return null;
-    const withoutBuild = version.split("+")[0];
-    const dash = withoutBuild.indexOf("-");
-    const core = dash < 0 ? withoutBuild : withoutBuild.slice(0, dash);
-    const pre = dash < 0 ? "" : withoutBuild.slice(dash + 1);
-    const numbers = core.split(".");
-    if (numbers.length !== 3 || !numbers.every((part) => /^[0-9]+$/.test(part))) return null;
-    return { core: numbers.map(Number), pre: pre ? pre.split(".") : null };
-  };
-  const a = key(left);
-  const b = key(right);
+  const a = semverKey(left);
+  const b = semverKey(right);
   if (a === null || b === null) return null;
   for (let index = 0; index < 3; index += 1) {
     if (a.core[index] !== b.core[index]) return a.core[index] < b.core[index] ? -1 : 1;
@@ -198,14 +240,15 @@ export function semverCompare(left, right) {
   for (let index = 0; index < Math.min(a.pre.length, b.pre.length); index += 1) {
     const x = a.pre[index];
     const y = b.pre[index];
-    const xNumeric = /^[0-9]+$/.test(x);
-    const yNumeric = /^[0-9]+$/.test(y);
+    const xNumeric = x.text === undefined;
+    const yNumeric = y.text === undefined;
     if (xNumeric && yNumeric) {
-      if (Number(x) !== Number(y)) return Number(x) < Number(y) ? -1 : 1;
+      if (x.number !== y.number) return x.number < y.number ? -1 : 1;
     } else if (xNumeric !== yNumeric) {
       return xNumeric ? -1 : 1;
-    } else if (x !== y) {
-      return x < y ? -1 : 1;
+    } else {
+      const order = compareCodePoints(x.text, y.text);
+      if (order) return order;
     }
   }
   return a.pre.length === b.pre.length ? 0 : a.pre.length < b.pre.length ? -1 : 1;
@@ -259,6 +302,23 @@ function checkParentheses(expression, found) {
   }
 }
 
+function daysIn(year, month) {
+  if (month === 2) return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28;
+  return [4, 6, 9, 11].includes(month) ? 30 : 31;
+}
+
+// The schema checks the shape of released_at. This checks that the calendar has
+// that day and time, as check_schema.check_timestamp does.
+function checkTimestamp(value, found) {
+  if (typeof value !== "string") return;
+  const parts = TIMESTAMP.exec(value);
+  if (!parts) return;
+  const [year, month, day, hour, minute, second] = parts.slice(1).map(Number);
+  const real = year >= 1 && month >= 1 && month <= 12 && day >= 1 && day <= daysIn(year, month)
+    && hour <= 23 && minute <= 59 && second <= 59;
+  if (!real) found.push(message(ERROR, "released_at", `'${value}' is not a real date and time`));
+}
+
 function checkLinkKeys(links, found) {
   if (!isObject(links)) return;
   const seen = new Map();
@@ -297,12 +357,29 @@ function checkDependencies(document, own, found) {
   });
 }
 
+function checkPins(document, own, found) {
+  const pinned = new Map();
+  for (const section of PINNED_SECTIONS) {
+    const entries = document[section];
+    if (!Array.isArray(entries)) continue;
+    entries.forEach((entry, index) => {
+      const identifier = isObject(entry) ? fold(entry.id) : null;
+      if (identifier === null) return;
+      const where = `${section}[${index}]`;
+      if (identifier === own) found.push(message(ERROR, where, "a pack cannot pin itself"));
+      else if (pinned.has(identifier)) found.push(message(ERROR, where, `'${entry.id}' is pinned by ${pinned.get(identifier)}`));
+      if (!pinned.has(identifier)) pinned.set(identifier, where);
+    });
+  }
+}
+
 export function documentRules(document) {
   const found = [];
   const own = fold(document.id);
   checkLinkKeys(document.links, found);
   if (isObject(document.compatibility)) checkGameBounds(document.compatibility, found);
   checkParentheses(document.license, found);
+  checkTimestamp(document.released_at, found);
   if (typeof document.superseded_by === "string" && fold(document.superseded_by) === own) {
     found.push(message(ERROR, "superseded_by", "a listing cannot supersede itself"));
   }
@@ -311,6 +388,7 @@ export function documentRules(document) {
     if (fold(document.loader.id) === own) found.push(message(ERROR, "loader", "a listing cannot be its own loader"));
   }
   checkDependencies(document, own, found);
+  checkPins(document, own, found);
   return found;
 }
 
@@ -414,6 +492,20 @@ export function curatedTags(tagsText) {
   const vocabulary = parseDocument(tagsText);
   const entries = Array.isArray(vocabulary.mod) ? vocabulary.mod : [];
   return entries.filter((entry) => isObject(entry) && typeof entry.tag === "string");
+}
+
+export function normalizeTag(entry) {
+  return entry.toLowerCase().replace(/[\s_]+/gu, "-").replace(/^-+|-+$/gu, "");
+}
+
+export function addTag(tags, entry, pattern) {
+  const typed = entry.trim();
+  if (!typed) return { tags, error: null };
+  const tag = normalizeTag(typed);
+  if (!pattern.test(tag)) {
+    return { tags, error: `'${typed}' cannot be a tag. A tag is lowercase letters and digits in words joined by -, such as space-station.` };
+  }
+  return { tags: tags.includes(tag) ? tags : [...tags, tag], error: null };
 }
 
 export function tagNotes(document, curated) {
@@ -553,6 +645,16 @@ export function indexRules(document, index, own) {
       }
     });
   }
+  for (const section of PINNED_SECTIONS) {
+    if (!Array.isArray(document[section])) continue;
+    document[section].forEach((member, number) => {
+      if (!isObject(member)) return;
+      const where = `${section}[${number}]`;
+      if (resolve(member.id, where) === "modpack") {
+        found.push(message(ERROR, where, `'${member.id}' is itself a pack, and a pack does not nest in spec_version 1`));
+      }
+    });
+  }
   const links = isObject(document.links) ? document.links : {};
   const thread = threadOf(index.threadPattern, links.forums);
   if (thread !== null) {
@@ -600,6 +702,7 @@ export function releaseListRules(document, gameVersions, now = new Date()) {
 export function createChecker({ schema, tagsText }) {
   const ajv = new Ajv2020({ allErrors: true, strict: false, verbose: true });
   const validate = ajv.compile(schema);
+  const contentId = ajv.compile(schema.$defs.contentId);
   const vocabulary = curatedTags(tagsText);
   const curated = vocabulary.map((entry) => entry.tag);
   const pattern = threadPattern(schema);
@@ -607,7 +710,9 @@ export function createChecker({ schema, tagsText }) {
     vocabulary,
     curated,
     threadPattern: pattern,
+    tagPattern: new RegExp(schema.$defs.tag.pattern, "u"),
     maxDescriptionImages: schema.properties.images.properties.description.maxItems,
+    validId: (id) => contentId(id),
     offline(document) {
       return [
         ...schemaMessages(validate, document),

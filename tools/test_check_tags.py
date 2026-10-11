@@ -5,6 +5,7 @@
 
 import tempfile
 import sys
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -36,6 +37,22 @@ class Vocabulary(unittest.TestCase):
                 "tools",
                 "library",
             ],
+        )
+
+    def test_every_repository_forum_prefix_has_its_id(self):
+        with check_tags.TAGS.open("rb") as handle:
+            entries = tomllib.load(handle)["mod"]
+        self.assertEqual(
+            {entry["tag"]: entry.get("forum_prefix_id") for entry in entries if "forum_prefix" in entry},
+            {
+                "parts": 4,
+                "celestial": 6,
+                "gameplay": 9,
+                "user-interface": 8,
+                "visual": 11,
+                "audio": 7,
+                "tools": 10,
+            },
         )
 
     def test_a_boolean_spec_version_is_invalid(self):
@@ -71,6 +88,39 @@ class Vocabulary(unittest.TestCase):
         path = self.write('spec_version = 1\n[[mod]]\ntag = "parts"\nname = "Parts"\n')
         _, errors = check_tags.load_vocabulary(path)
         self.assertTrue(any("'meaning' is required" in error for error in errors))
+
+    def prefixed(self, *entries):
+        text = "spec_version = 1\n"
+        for tag, prefix, prefix_id in entries:
+            text += f'[[mod]]\ntag = "{tag}"\nname = "{tag}"\nmeaning = "Some {tag}."\n'
+            if prefix is not None:
+                text += f'forum_prefix = "{prefix}"\n'
+            if prefix_id is not None:
+                text += f"forum_prefix_id = {prefix_id}\n"
+        path = self.write(text)
+        _, errors = check_tags.load_vocabulary(path)
+        where = check_tags._relative(path)
+        return [error.removeprefix(f"{where}: ") for error in errors]
+
+    def test_forum_prefix_ids_are_valid(self):
+        errors = self.prefixed(("parts", "Parts", 4), ("tools", "Tools", 10), ("library", None, None))
+        self.assertEqual(errors, [])
+
+    def test_a_duplicate_forum_prefix_id_is_rejected(self):
+        errors = self.prefixed(("parts", "Parts", 4), ("tools", "Tools", 4))
+        self.assertEqual(errors, ["mod[1]: forum_prefix_id 4 is already defined"])
+
+    def test_a_forum_prefix_id_that_is_not_a_positive_integer_is_rejected(self):
+        for value in ("0", "-4", '"4"', "4.0", "true"):
+            with self.subTest(value=value):
+                errors = self.prefixed(("parts", "Parts", value))
+                self.assertEqual(
+                    errors, ["mod[0]: 'forum_prefix_id' must be a positive integer"]
+                )
+
+    def test_a_forum_prefix_id_without_forum_prefix_is_rejected(self):
+        errors = self.prefixed(("library", None, 12))
+        self.assertEqual(errors, ["mod[0]: 'forum_prefix_id' needs 'forum_prefix'"])
 
 
 class AuthoredDocuments(unittest.TestCase):
