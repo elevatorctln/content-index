@@ -49,6 +49,8 @@ A code mod that reads the profile by that hardcoded path then finds an empty or 
 `license` is an SPDX license expression.
 For one license, write its identifier from the [SPDX license list](https://spdx.org/licenses/), such as `MIT` or `CC-BY-SA-4.0`.
 The identifier is the short form with hyphens, so `CC BY-SA 4.0` is not valid.
+The identifier names a version where the license has one, so `GPL` alone is not valid, and you write `GPL-3.0-only` or `GPL-3.0-or-later` instead.
+When an identifier is not on the list, the check names the identifiers that are close to it.
 
 When parts of your content have different licenses, join them with `AND`.
 For example, code under GPL-2.0 and data files under CC BY-SA 4.0:
@@ -269,6 +271,24 @@ When an old release needs other facts, you correct them with an [amendment](http
 
 A lower `since` later stamps more releases.
 A higher `since` removes no release that is already stamped.
+
+## A repository with other releases
+
+When your GitHub repository also publishes releases that are not releases of your mod, such as tools or images, set `tag_prefix` under `[releases]` to the text that every tag of a mod release starts with, per [RFC 0096](https://github.com/KSAModding/content-manager-design/blob/main/rfcs/0096-tag-prefix.md):
+
+```toml
+[releases]
+github = "owner/repository"
+tag_prefix = "mymod-"
+```
+
+The watcher then takes only the releases whose tag starts with `tag_prefix`, with upper and lower case as written, and reads the version from the rest of the tag, so `mymod-v1.2.0` and `mymod-1.2.0` are both `1.2.0`.
+Every other release of the repository is not a release of your mod, so it is never stamped and never reported.
+`tag_prefix` is text without spaces, it needs `github` next to it, and SpaceDock, which has no tags, ignores it.
+`since` compares with the version of the rest of the tag.
+A `tag_prefix` that no release of the repository starts with is refused, so a typo does not hide every release.
+When you change the form of your tags, change `tag_prefix` too, or the watcher stamps nothing new.
+A changed `tag_prefix` changes no release that is already stamped.
 
 ## no rename possible
 

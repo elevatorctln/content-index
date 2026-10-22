@@ -26,6 +26,8 @@ from jsonschema.exceptions import best_match
 ROOT = Path(__file__).resolve().parent.parent
 SCHEMA = ROOT / "schemas" / "authored.schema.json"
 LISTINGS = ROOT / "listings"
+VEHICLES = ROOT / "vehicles"
+SAVES = ROOT / "saves"
 PACKS = ROOT / "packs"
 
 REVISION_BOUND = re.compile(r"^[0-9]{4}\.[0-9]+\.[0-9]+\.([0-9]+)(?![\s\S])")
@@ -60,8 +62,16 @@ def load(path, errors):
         with path.open("rb") as handle:
             return normalise(tomllib.load(handle))
     except tomllib.TOMLDecodeError as error:
-        errors.append(f"{path}: not valid TOML, {error}")
+        errors.append(f"{_relative(path)}: not valid TOML, {error}")
         return None
+
+
+def _relative(path):
+    """The path from the repository root, as the other checks name a document."""
+    try:
+        return Path(path).resolve().relative_to(ROOT).as_posix()
+    except ValueError:
+        return str(path)
 
 
 def pointer(error):
@@ -344,7 +354,7 @@ def documents():
             and len(path.relative_to(folder).parts) == depth
         )
 
-    return toml_files(LISTINGS, 1) + toml_files(PACKS, 2)
+    return toml_files(LISTINGS, 1) + toml_files(VEHICLES, 1) + toml_files(SAVES, 1) + toml_files(PACKS, 2)
 
 
 def validator():

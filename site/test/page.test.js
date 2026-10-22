@@ -54,6 +54,12 @@ test("a text that a pack shows names what is listed through the word the type se
   assert.match(render, /querySelectorAll\("\.not-pack"\)\) part\.hidden = shown\.pack/);
 });
 
+test("the game_max hint says that clients block above it", () => {
+  const hint = /<p id="hint-game-max"[^>]*>([\s\S]*?)<\/p>/.exec(html)[1];
+  assert.match(hint, /Above this version, clients block the <span class="noun">mod<\/span>/);
+  assert.doesNotMatch(hint, /warning/);
+});
+
 function body(start) {
   const from = app.indexOf(start);
   assert.ok(from >= 0, `js/app.js has no ${start}`);
@@ -68,6 +74,17 @@ test("the since field shows next to a release host and tells what the watcher st
   const hint = /<p id="hint-since"[^>]*>([\s\S]*?)<\/p>/.exec(html)[1];
   assert.match(hint, /stamps every older release from that version on, with the facts this listing states today/);
   assert.match(hint, /amendment/);
+});
+
+test("the tag_prefix field shows next to a GitHub repository and tells what it selects", () => {
+  const input = html.match(/<input id="tag-prefix"[^>]*>/);
+  assert.ok(input && /aria-describedby="[^"]*\bmsg-releases\.tag_prefix\b/.test(input[0]), "the tag-prefix input does not name msg-releases.tag_prefix");
+  assert.match(app, /\n  "tag-prefix": \["tagPrefix"\],\n/, "the tag-prefix input is not bound to state.form.tagPrefix");
+  assert.match(body("function refresh()"), /\$\("tag-prefix-field"\)\.hidden = !state\.form\.github\.trim\(\);/);
+  assert.ok(html.indexOf('id="tag-prefix-field"') < html.indexOf('id="since-field"'), "the tag_prefix field is not next to since");
+  const hint = /<p id="hint-tag-prefix"[^>]*>([\s\S]*?)<\/p>/.exec(html)[1];
+  assert.match(hint, /takes only the releases whose tag starts with it/);
+  assert.match(hint, /reads the version from the rest of the tag/);
 });
 
 test("a hidden field does not mark its section as done", () => {

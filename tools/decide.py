@@ -20,6 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import check_scope
+import explain
 import ownership
 import pack_ownership
 
@@ -40,6 +41,8 @@ LABELS = {
     STEWARD_LABEL: ("d93f0b", "waiting on a steward"),
     check_scope.LISTING_KIND: ("0e8a16", "changes a listing document"),
     check_scope.PACK_KIND: ("0e8a16", "changes a pack document"),
+    check_scope.VEHICLE_KIND: ("0e8a16", "changes a vehicle document"),
+    check_scope.SAVE_KIND: ("0e8a16", "changes a save document"),
 }
 
 # One label per kind of document, so the queue separates a submission from a
@@ -52,7 +55,15 @@ PULL_REQUEST_EVENT = "pull_request"
 
 STATUS_FILE = "index-status.toml"
 # A listing path that is safe to put into a URL and into Markdown.
-PLAIN_LISTING = re.compile(r"listings/[A-Za-z0-9._-]+\.toml")
+PLAIN_LISTING = re.compile(r"(?:listings|vehicles|saves)/[A-Za-z0-9._-]+\.toml")
+
+# The kinds of document that are one file each, by the folder that holds them.
+# A vehicle or a save is a listing in every rule that reads its owner.
+LISTING_FOLDERS = {
+    "listings": check_scope.LISTING_KIND,
+    "vehicles": check_scope.VEHICLE_KIND,
+    "saves": check_scope.SAVE_KIND,
+}
 
 PASS = "pass"
 REJECT = "reject"
@@ -68,25 +79,120 @@ class Decision:
         self.comment = comment
 
 
-def _messages(verdict):
-    lines = []
+PUSH_AGAIN = "Push a fix and the checks run again."
+# A pull_request run starts on a reopen too, so the author needs nobody to run
+# the checks again.
+RELEASE_AGAIN = (
+    "Nothing in this pull request has to change. Fix the release on GitHub or SpaceDock as the "
+    "text above says, then close and reopen this pull request, and the checks run again. You "
+    "can also comment here, and a steward runs them."
+)
+RUN_AGAIN = (
+    "Nothing in this pull request has to change for this. Close and reopen this pull request, "
+    "or push a commit, and the checks run again."
+)
+FIX_OR_RUN_AGAIN = (
+    "If the text above names a fix, push it. If not, close and reopen this pull request. Either "
+    "way, the checks run again."
+)
+PROOF_AGAIN = "When the proof is in place, comment here, so a steward runs the checks again."
+
+
+def _findings(verdict):
+    """The (rejected, unchecked, notes) of the verdict, each a list of (check name, message).
+
+    A verdict from before the split carries one list of messages per check,
+    which are errors when the check did not pass and notes when it did. Lines
+    for the job summary only never reach the comment.
+    """
+    rejected, unchecked, notes = [], [], []
     for check in verdict.get("checks") or []:
-        for message in check.get("messages") or []:
-            lines.append(f"- `{check.get('name')}`: {message}")
-    return lines
+        name = check.get("name")
+        outcome = check.get("outcome")
+        if "errors" in check or "notes" in check:
+            errors, noted = check.get("errors") or [], check.get("notes") or []
+        elif outcome == PASS:
+            errors, noted = [], check.get("messages") or []
+        else:
+            errors, noted = check.get("messages") or [], []
+        failed = rejected if outcome == REJECT else unchecked
+        failed.extend((name, message) for message in errors)
+        unchecked.extend((name, message) for message in check.get("unchecked") or [])
+        notes.extend((name, message) for message in noted)
+    return rejected, unchecked, notes
+
+
+def _section(title, found):
+    """The lines of one section, with each message and each explanation once.
+
+    Several checks can report one cause, such as a license or a TOML error. The
+    same message from several checks is one line that names all of them, and a
+    later message with the same explanation gets no second copy of it.
+    """
+    lines = [f"**{title}**"]
+    shown = set()
+    names = {}
+    for name, message in found:
+        reporters = names.setdefault(message, [])
+        if name not in reporters:
+            reporters.append(name)
+    for message, reporters in names.items():
+        lines.append(f"- {', '.join(f'`{name}`' for name in reporters)}: {message}")
+        explanation = explain.explain(message)
+        if explanation and explanation.text not in shown:
+            shown.add(explanation.text)
+            lines.append(f"  - {explanation.text}")
+    return "\n".join(lines)
 
 
 def _comment(first, verdict, paragraphs=(), run_url="", rerun=False):
     sections = [first]
-    messages = _messages(verdict)
-    if messages:
-        sections.append("Notes:\n" + "\n".join(messages))
+    rejected, unchecked, notes = _findings(verdict)
+    for title, found in (
+        ("What has to change", rejected),
+        ("What could not be checked", unchecked),
+        ("For your information", notes),
+    ):
+        if found:
+            sections.append(_section(title, found))
     sections.extend(paragraphs)
     if rerun:
-        sections.append("Push a fix and the checks run again.")
+        sections.append(_rerun(rejected, unchecked, verdict.get("verdict")))
     if run_url:
         sections.append(f"[The validation run]({run_url})")
     return "\n\n".join(sections)
+
+
+def _rerun(rejected, unchecked, outcome):
+    """How the checks run again after the fix.
+
+    A fix in the pull request is a push. A fix on the release host changes no
+    file here, and what could not be checked needs no fix, so both only need a
+    new run.
+    """
+    if rejected:
+        explained = [explain.explain(message) for _, message in rejected]
+        outside = all(found and found.outside_pull_request for found in explained)
+        return RELEASE_AGAIN if outside else PUSH_AGAIN
+    if unchecked or outcome not in (PASS, REJECT):
+        # Some of these lines, such as a host name that is not found, can be a
+        # typo in the pull request.
+        explained = [explain.explain(message) for _, message in unchecked]
+        if any(found and not found.outside_pull_request for found in explained):
+            return FIX_OR_RUN_AGAIN
+        return RUN_AGAIN
+    return PUSH_AGAIN
+
+
+def _ownership_paragraphs(result):
+    """The reason ownership is not verified, the advice, and the proof for each repository."""
+    explained = dict.fromkeys(
+        found.text for found in map(explain.explain, result.reason.splitlines()) if found
+    )
+    paragraphs = [_sentence(result.reason), result.instructions or ownership.ADVICE, *explained]
+    if explained:
+        paragraphs.append(PROOF_AGAIN)
+    return paragraphs
 
 
 def decide(verdict, candidate, ownership_result, run_url="", advice=()):
@@ -166,14 +272,13 @@ def decide(verdict, candidate, ownership_result, run_url="", advice=()):
             ),
         )
 
-    instructions = ownership_result.instructions or ownership.ADVICE
     return Decision(
         "success",
         "validated, ownership not verified",
         needs_steward=True,
         comment=comment(
             "Validated, and ownership is not verified, so a steward decides.",
-            [_sentence(ownership_result.reason), instructions],
+            _ownership_paragraphs(ownership_result),
         ),
     )
 
@@ -634,8 +739,9 @@ def status_subjects(api, base_ref, head_sha):
         base = _states(api.file(api.repository, STATUS_FILE, ref=merge_base))
         head = _states(api.file(api.repository, STATUS_FILE, ref=head_sha))
         listings = {
-            name[: -len(".toml")].casefold(): name
-            for name, kind in api.folder("listings", base_ref)
+            name[: -len(".toml")].casefold(): (subject, f"{folder}/{name}")
+            for folder, subject in LISTING_FOLDERS.items()
+            for name, kind in api.folder(folder, base_ref)
             if kind == "file" and name.lower().endswith(".toml")
         }
         packs = {name.casefold(): name for name, kind in api.folder("packs", base_ref) if kind == "dir"}
@@ -649,7 +755,7 @@ def status_subjects(api, base_ref, head_sha):
         if base.get(folded, set()) == head.get(folded, set()):
             continue
         if folded in listings:
-            subjects.append((check_scope.LISTING_KIND, f"listings/{listings[folded]}"))
+            subjects.append(listings[folded])
         elif folded in packs:
             subjects.append((check_scope.PACK_KIND, packs[folded]))
     return subjects, ""
@@ -680,8 +786,8 @@ def owner_notes(api, pull, changes, head_sha):
     for change in changes:
         path = change.previous_path or change.path
         parts = path.split("/")
-        if check_scope.kind_of(path) == check_scope.LISTING_KIND:
-            subjects.append((check_scope.LISTING_KIND, path, changed))
+        if check_scope.kind_of(path) in LISTING_FOLDERS.values():
+            subjects.append((check_scope.kind_of(path), path, changed))
         elif len(parts) == 3 and parts[0] == "packs":
             subjects.append((check_scope.PACK_KIND, parts[1], changed))
     lines = []
@@ -870,7 +976,7 @@ def act(api, arguments):
         verdict = {
             "verdict": COULD_NOT_EVALUATE,
             "checks": [{"name": "validate", "outcome": COULD_NOT_EVALUATE,
-                        "messages": [verdict_error]}],
+                        "errors": [verdict_error]}],
         }
     else:
         agrees, reason = _agrees(verdict, number, arguments.head_sha)

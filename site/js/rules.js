@@ -1,6 +1,11 @@
 import Ajv2020 from "../vendor/ajv2020.js";
 import { parse as parseSpdx, exceptions } from "../vendor/spdx.js";
-import { LICENSES as LICENSE_IDS, EXCEPTIONS as EXCEPTION_IDS } from "./licenses.js";
+import {
+  LICENSES as LICENSE_IDS,
+  EXCEPTIONS as EXCEPTION_IDS,
+  CURRENT_LICENSES,
+  CURRENT_EXCEPTIONS,
+} from "./licenses.js";
 import { parseDocument } from "./toml.js";
 import { records, ICON, DESCRIPTION, LIMITS, outsideLimits, centerSquare } from "./images.js";
 import { scan, SCHEME } from "./markdown.js";
@@ -11,7 +16,10 @@ export const NOTE = "note";
 export const ABSTRACT_LIMIT = 280;
 export const TAGS_SPEC = "https://github.com/KSAModding/content-manager-design/blob/main/spec/tags.md";
 const SPDX_LIST = "https://spdx.org/licenses/";
-const TAG_VOCABULARY = { mod: "mod", "mod-loader": "mod", modpack: "mod" };
+const CLOSE_LIMIT = 6;
+// RFC 0085 keeps the tags of a vehicle or a save free-form until spec/tags.md
+// lists some for them, so they get no note.
+const TAG_VOCABULARY = { mod: "mod", "mod-loader": "mod", modpack: "mod", vehicle: null, save: null };
 const PINNED_SECTIONS = ["mods", "vehicles", "saves"];
 
 const REVISION_BOUND = /^[0-9]{4}\.[0-9]+\.[0-9]+\.([0-9]+)(?![\s\S])/;
@@ -407,8 +415,59 @@ function missingOperator(expression) {
   );
 }
 
-function notOnTheList(expression, named) {
-  return `'${expression}' names ${named}, which is not on the SPDX license list; the identifiers are at ${SPDX_LIST}`;
+// The ids that start like a name, as check_license.close_ids finds them: an id
+// that is the start itself first, then the ids that continue with a version,
+// then the shorter ones.
+export function closeIds(name, ids = CURRENT_LICENSES) {
+  let letters = /^[A-Za-z]*/.exec(name)[0];
+  if (/[vV]$/.test(letters) && /^[0-9]/.test(name.slice(letters.length))) letters = letters.slice(0, -1);
+  for (const stem of [name, name.replace(/\s+/g, "-"), letters]) {
+    if (!stem) continue;
+    const folded = stem.toLowerCase();
+    const prefix = `${folded}-`;
+    const found = ids.filter((id) => id.toLowerCase() === folded || id.toLowerCase().startsWith(prefix));
+    if (!found.length) continue;
+    const key = (id) => id.toLowerCase() === folded
+      ? [0, 0, 0, "", ""]
+      : [1, /[0-9]/.test(id[prefix.length]) ? 0 : 1, id.length, id.toLowerCase(), id];
+    found.sort((left, right) => {
+      const [a, b] = [key(left), key(right)];
+      for (let place = 0; place < a.length; place += 1) {
+        if (a[place] !== b[place]) return a[place] < b[place] ? -1 : 1;
+      }
+      return 0;
+    });
+    return found.slice(0, CLOSE_LIMIT);
+  }
+  return [];
+}
+
+function escapeRegex(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Whether a name stands directly after a WITH, where only an exception goes, as
+// check_license.after_with tells it.
+function afterWith(expression, name) {
+  const words = name.split(/\s+/).filter(Boolean).map(escapeRegex).join("\\s+");
+  return new RegExp(`(?<![^\\s()])WITH\\s+${words}(?![^\\s()])`, "i").test(expression);
+}
+
+// A name after WITH gets close exception ids and any other name gets close
+// license ids, so a hint never names an id that is wrong in that place.
+function closeText(expression, names) {
+  return names
+    .filter((name) => !known(name))
+    .map((name) => [name, closeIds(name, afterWith(expression, name) ? CURRENT_EXCEPTIONS : CURRENT_LICENSES)])
+    .filter(([, found]) => found.length)
+    .map(([name, found]) => found.length === 1
+      ? `; the id close to ${name} is ${found[0]}`
+      : `; ids close to ${name} are ${found.slice(0, -1).join(", ")} and ${found[found.length - 1]}`)
+    .join("");
+}
+
+function notOnTheList(expression, names) {
+  return `'${expression}' names ${names.join(", ")}, which is not on the SPDX license list${closeText(expression, names)}; the identifiers are at ${SPDX_LIST}`;
 }
 
 function holdsAReference(name) {
@@ -476,7 +535,7 @@ export function licenseErrors(expression) {
   if (misplaced === null && sequence) return [missingOperator(expression)];
   const named = misplaced !== null ? [misplaced] : [...unknown].sort();
   if (named.some(holdsAReference)) return [missingOperator(expression)];
-  if (named.length) return [notOnTheList(expression, named.join(", "))];
+  if (named.length) return [notOnTheList(expression, named)];
   return [];
 }
 
@@ -699,6 +758,29 @@ export function releaseListRules(document, gameVersions, now = new Date()) {
   return found;
 }
 
+export function gameMaxText(bound) {
+  return `'${bound}' is the newest game build the index knows, and clients block the content on `
+    + "every build above game_max, so a game_max that only says which build the content was "
+    + "tested with blocks it on the next game update";
+}
+
+// The same note as tools/check_index.py: a game_max at the newest build usually means
+// "tested with", and RFC 0091 makes a client block the content above it.
+export function gameMaxNotes(document, gameVersions) {
+  const compatibility = isObject(document.compatibility) ? document.compatibility : {};
+  const bound = compatibility.game_max;
+  const match = typeof bound === "string" ? REVISION_BOUND.exec(bound) : null;
+  if (!match || !Array.isArray(gameVersions)) return [];
+  const revisions = gameVersions
+    .map((version) => (typeof version === "string" ? REVISION_BOUND.exec(version) : null))
+    .filter(Boolean)
+    .map((found) => BigInt(found[1]));
+  if (!revisions.length) return [];
+  const newest = revisions.reduce((high, revision) => (revision > high ? revision : high));
+  if (BigInt(match[1]) !== newest) return [];
+  return [message(NOTE, "compatibility.game_max", gameMaxText(bound))];
+}
+
 export function createChecker({ schema, tagsText }) {
   const ajv = new Ajv2020({ allErrors: true, strict: false, verbose: true });
   const validate = ajv.compile(schema);
@@ -728,6 +810,7 @@ export function createChecker({ schema, tagsText }) {
         ...this.offline(document),
         ...indexRules(document, index, own),
         ...releaseListRules(document, gameVersions),
+        ...gameMaxNotes(document, gameVersions),
       ];
     },
   };
